@@ -1,0 +1,24 @@
+# name: test/sql/annsearch_list.test
+# description: Test annsearch_list unified listing
+# group: [annsearch]
+
+require annsearch
+
+# Empty list at start
+query IIIIIII
+SELECT * FROM annsearch_list();
+----
+
+# Create a diskann index
+statement ok
+SELECT * FROM diskann_create('da_idx', 3);
+
+# annsearch_list should show it with engine=diskann
+query II
+SELECT name, engine FROM annsearch_list();
+----
+da_idx	diskann
+
+# Cleanup
+statement ok
+SELECT * FROM diskann_destroy('da_idx');

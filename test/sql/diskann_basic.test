@@ -1,0 +1,58 @@
+# name: test/sql/diskann_basic.test
+# description: Test basic DiskANN extension functionality
+# group: [diskann]
+
+require annsearch
+
+# Create an index
+query I
+SELECT * FROM diskann_create('test_idx', 3);
+----
+Created index 'test_idx' (dim=3, metric=L2, R=64, L=128)
+
+# List indexes
+query IIIII
+SELECT * FROM diskann_list();
+----
+test_idx	3	0	L2	64
+
+# Add vectors
+query I
+SELECT diskann_add('test_idx', [1.0, 0.0, 0.0]::FLOAT[]);
+----
+0
+
+query I
+SELECT diskann_add('test_idx', [0.0, 1.0, 0.0]::FLOAT[]);
+----
+1
+
+query I
+SELECT diskann_add('test_idx', [0.0, 0.0, 1.0]::FLOAT[]);
+----
+2
+
+# Verify count
+query II
+SELECT key, value FROM diskann_info('test_idx') WHERE key = 'count';
+----
+count	3
+
+# Search for nearest to [1,0,0] -- should return label 0 first
+query II
+SELECT label, distance FROM diskann_search('test_idx', [1.0, 0.0, 0.0]::FLOAT[], 2);
+----
+0	0.0
+1	2.0
+
+# Destroy
+query I
+SELECT * FROM diskann_destroy('test_idx');
+----
+Destroyed index 'test_idx'
+
+# Verify empty list
+query IIIII
+SELECT * FROM diskann_list();
+----
+

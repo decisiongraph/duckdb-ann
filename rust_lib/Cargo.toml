@@ -1,0 +1,30 @@
+[package]
+name = "diskann_rust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "DiskANN operations exposed via C FFI for the DuckDB extension"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+# DiskANN -- official Microsoft Rust rewrite
+diskann = { version = "0.45", features = ["testing"] }
+
+# Async runtime (diskann is async-native)
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+# Concurrency
+parking_lot = "0.12"
+dashmap = "6"
+
+# Error handling
+anyhow = "1"
+
+# JSON serialization for complex returns
+serde_json = "1"
