@@ -2,52 +2,8 @@
 //! Called from the C++ DuckDB extension.
 
 use crate::index_manager::{self, InMemoryIndex, Metric};
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, CStr};
 use std::ptr;
-
-// ========================================
-// JSON-based result (kept for list/info)
-// ========================================
-
-/// FFI-safe result: either json_ptr or error_ptr is set.
-/// Caller must free with `diskann_free_result`.
-#[repr(C)]
-pub struct DiskannResult {
-    pub json_ptr: *mut c_char,
-    pub error_ptr: *mut c_char,
-}
-
-fn ok_result(json: String) -> DiskannResult {
-    DiskannResult {
-        json_ptr: string_to_ptr(json),
-        error_ptr: ptr::null_mut(),
-    }
-}
-
-fn err_result(msg: String) -> DiskannResult {
-    DiskannResult {
-        json_ptr: ptr::null_mut(),
-        error_ptr: string_to_ptr(msg),
-    }
-}
-
-fn string_to_ptr(s: String) -> *mut c_char {
-    match CString::new(s) {
-        Ok(cs) => cs.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
-}
-
-/// Free a DiskannResult (both pointers).
-#[no_mangle]
-pub unsafe extern "C" fn diskann_free_result(result: DiskannResult) {
-    if !result.json_ptr.is_null() {
-        drop(CString::from_raw(result.json_ptr));
-    }
-    if !result.error_ptr.is_null() {
-        drop(CString::from_raw(result.error_ptr));
-    }
-}
 
 // ========================================
 // Buffer-based helpers
@@ -426,38 +382,88 @@ pub unsafe extern "C" fn diskann_streaming_build_buf(
 }
 
 // ========================================
-// JSON-based functions (kept for list/info)
+// repr(C) struct-based list/info functions
 // ========================================
 
-/// List all indexes. Returns JSON array of index info objects.
-#[no_mangle]
-pub extern "C" fn diskann_list_indexes() -> DiskannResult {
-    let infos = index_manager::list_indexes();
-    let items: Vec<String> = infos
-        .iter()
-        .map(|i| {
-            format!(
-                "{{\"name\":\"{}\",\"dimension\":{},\"count\":{},\"metric\":\"{}\",\"max_degree\":{},\"read_only\":{}}}",
-                i.name, i.dimension, i.count, i.metric, i.max_degree, i.read_only
-            )
-        })
-        .collect();
-    ok_result(format!("[{}]", items.join(",")))
+/// FFI-safe index info. Fixed-size, stack-allocatable, no heap.
+#[repr(C)]
+pub struct DiskannIndexInfo {
+    pub name: [u8; 256],
+    pub dimension: u64,
+    pub count: u64,
+    pub metric: u8,           // 0 = L2, 1 = IP
+    pub max_degree: u32,
+    pub build_complexity: u32,
+    pub alpha: f32,
+    pub read_only: u8,        // 0 = false, 1 = true
 }
 
-/// Get info for a single index. Returns JSON key-value object.
-#[no_mangle]
-pub unsafe extern "C" fn diskann_get_info(name: *const c_char) -> DiskannResult {
-    let name = match CStr::from_ptr(name).to_str() {
-        Ok(s) => s,
-        Err(e) => return err_result(format!("Invalid name: {}", e)),
+fn write_name(buf: &mut [u8; 256], s: &str) {
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(255);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    buf[len] = 0;
+}
+
+fn info_to_ffi(info: &index_manager::IndexInfo) -> DiskannIndexInfo {
+    let mut ffi = DiskannIndexInfo {
+        name: [0u8; 256],
+        dimension: info.dimension as u64,
+        count: info.count as u64,
+        metric: match info.metric { Metric::L2 => 0, Metric::InnerProduct => 1 },
+        max_degree: info.max_degree,
+        build_complexity: info.build_complexity,
+        alpha: info.alpha,
+        read_only: if info.read_only { 1 } else { 0 },
     };
+    write_name(&mut ffi.name, &info.name);
+    ffi
+}
+
+/// List indexes into caller-provided buffer.
+/// Returns number of indexes written, or total count if out_buf is null.
+#[no_mangle]
+pub unsafe extern "C" fn diskann_list_indexes_buf(
+    out_buf: *mut DiskannIndexInfo,
+    buf_capacity: i32,
+) -> i32 {
+    let infos = index_manager::list_indexes();
+    if out_buf.is_null() {
+        return infos.len() as i32;
+    }
+    let n = infos.len().min(buf_capacity as usize);
+    let slice = std::slice::from_raw_parts_mut(out_buf, n);
+    for (i, info) in infos.iter().take(n).enumerate() {
+        slice[i] = info_to_ffi(info);
+    }
+    n as i32
+}
+
+/// Get info for a single index. Returns 0 on success, -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn diskann_get_info_buf(
+    name: *const c_char,
+    out_info: *mut DiskannIndexInfo,
+    err_buf: *mut c_char,
+    err_buf_len: i32,
+) -> i32 {
+    let name = match cstr_to_str(name, "name", err_buf, err_buf_len) {
+        Some(s) => s,
+        None => return -1,
+    };
+    if out_info.is_null() {
+        write_err(err_buf, err_buf_len, "Null output pointer");
+        return -1;
+    }
     match index_manager::get_info(name) {
-        Ok(info) => ok_result(format!(
-            "{{\"name\":\"{}\",\"dimension\":{},\"count\":{},\"metric\":\"{}\",\"max_degree\":{},\"build_complexity\":{},\"alpha\":{},\"read_only\":{}}}",
-            info.name, info.dimension, info.count, info.metric, info.max_degree, info.build_complexity, info.alpha, info.read_only
-        )),
-        Err(e) => err_result(e.to_string()),
+        Ok(info) => {
+            *out_info = info_to_ffi(&info);
+            0
+        }
+        Err(e) => {
+            write_err(err_buf, err_buf_len, &e.to_string());
+            -1
+        }
     }
 }
 
@@ -586,17 +592,17 @@ pub unsafe extern "C" fn diskann_detached_search(
         write_err(err_buf, err_buf_len, "Invalid query");
         return -1;
     }
+    if out_labels.is_null() || out_distances.is_null() {
+        write_err(err_buf, err_buf_len, "Null output buffer");
+        return -1;
+    }
     let index = &*handle;
     let query = std::slice::from_raw_parts(query_ptr, dimension as usize);
-    match index.search(query, k as usize, search_complexity as u32) {
-        Ok(results) => {
-            let n = results.len().min(k as usize);
-            for i in 0..n {
-                *out_labels.add(i) = results[i].0 as i64;
-                *out_distances.add(i) = results[i].1;
-            }
-            n as i32
-        }
+    let out_labels_slice = std::slice::from_raw_parts_mut(out_labels, k as usize);
+    let out_distances_slice = std::slice::from_raw_parts_mut(out_distances, k as usize);
+    match index.search_into(query, k as usize, search_complexity as u32,
+                            out_labels_slice, out_distances_slice) {
+        Ok(n) => n as i32,
         Err(e) => {
             write_err(err_buf, err_buf_len, &e.to_string());
             -1
