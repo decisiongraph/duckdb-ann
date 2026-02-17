@@ -59,7 +59,12 @@ int32_t diskann_detached_get_vector(void *handle, uint32_t label, float *out_vec
 int32_t diskann_detached_quantize_sq8(void *handle);
 int32_t diskann_detached_is_quantized(void *handle);
 
-// Batch search (multi-query)
+// Detached batch search (multi-query, GPU-accelerated)
+int32_t diskann_detached_search_batch(void *handle, const float *query_matrix, int32_t nq, int32_t dimension, int32_t k,
+                                      int32_t search_complexity, int64_t *out_labels, float *out_distances,
+                                      int32_t *out_counts, char *err_buf, int32_t err_buf_len);
+
+// Batch search (multi-query, global registry)
 int32_t diskann_batch_search_buf(const char *name, const float *query_matrix, int32_t nq, int32_t dimension, int32_t k,
                                  int32_t search_complexity, int64_t *out_labels, float *out_distances,
                                  int32_t *out_counts, char *err_buf, int32_t err_buf_len);
@@ -195,7 +200,23 @@ bool DiskannDetachedIsQuantized(DiskannHandle handle) {
 }
 
 // ========================================
-// Batch search wrapper
+// Detached batch search wrapper
+// ========================================
+
+int32_t DiskannDetachedSearchBatch(DiskannHandle handle, const float *query_matrix, int32_t nq, int32_t dimension,
+                                   int32_t k, int32_t search_complexity, int64_t *out_labels, float *out_distances,
+                                   int32_t *out_counts) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	int32_t rc = diskann_detached_search_batch(handle, query_matrix, nq, dimension, k, search_complexity, out_labels,
+	                                           out_distances, out_counts, err_buf, ERR_BUF_LEN);
+	if (rc != 0) {
+		throw std::runtime_error("DiskANN detached batch search: " + std::string(err_buf));
+	}
+	return 0;
+}
+
+// ========================================
+// Global registry batch search wrapper
 // ========================================
 
 DiskannBatchSearchResult DiskannBatchSearch(const std::string &name, const float *query_matrix, int32_t nq,

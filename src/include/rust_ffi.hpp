@@ -30,6 +30,12 @@ int32_t DiskannDetachedSearch(DiskannHandle handle, const float *query, int32_t 
 // Get vector count.
 int64_t DiskannDetachedCount(DiskannHandle handle);
 
+// Multi-query batch search on detached index. Returns 0 on success, -1 on error.
+// Uses GPU-accelerated lock-step BFS when Metal is available and batch is large enough.
+int32_t DiskannDetachedSearchBatch(DiskannHandle handle, const float *query_matrix, int32_t nq, int32_t dimension,
+                                   int32_t k, int32_t search_complexity, int64_t *out_labels, float *out_distances,
+                                   int32_t *out_counts);
+
 // Serialize detached index to bytes. Caller must free with DiskannFreeSerializedBytes.
 struct DiskannSerializedData {
 	uint8_t *data;

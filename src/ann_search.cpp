@@ -379,6 +379,309 @@ static void AnnSearchBatchScan(ClientContext &context, TableFunctionInput &data,
 	output.SetCardinality(batch_size);
 }
 
+// ========================================
+// ann_search_table(TABLE queries, table, index, k)
+// ========================================
+// Streaming batch search: accepts TABLE input (subqueries, CTEs, generate_series, etc.).
+// Uses DuckDB's in_out_function pattern for true streaming.
+// Returns: input columns + base table columns + _distance.
+
+struct AnnSearchTableBindData : public FunctionData {
+	string table_name;
+	string index_name;
+	int32_t k;
+	int32_t search_complexity = 0;
+	idx_t vector_col_idx; // which input column has the query vector
+
+	// Base table columns
+	vector<string> base_column_names;
+	vector<LogicalType> base_column_types;
+	vector<StorageIndex> base_storage_ids;
+
+	// Input table columns
+	vector<LogicalType> input_types;
+	vector<string> input_names;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto copy = make_uniq<AnnSearchTableBindData>();
+		copy->table_name = table_name;
+		copy->index_name = index_name;
+		copy->k = k;
+		copy->search_complexity = search_complexity;
+		copy->vector_col_idx = vector_col_idx;
+		copy->base_column_names = base_column_names;
+		copy->base_column_types = base_column_types;
+		copy->base_storage_ids = base_storage_ids;
+		copy->input_types = input_types;
+		copy->input_names = input_names;
+		return std::move(copy);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<AnnSearchTableBindData>();
+		return table_name == other.table_name && index_name == other.index_name && k == other.k &&
+		       vector_col_idx == other.vector_col_idx;
+	}
+};
+
+struct AnnSearchTableGlobalState : public GlobalTableFunctionState {
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+
+struct AnnSearchTableLocalState : public LocalTableFunctionState {
+	struct ResultTriple {
+		idx_t input_row;
+		row_t base_row_id;
+		float distance;
+	};
+	vector<ResultTriple> results;
+	idx_t emit_offset = 0;
+	bool processed = false;
+};
+
+static unique_ptr<FunctionData> AnnSearchTableBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<AnnSearchTableBindData>();
+
+	// Scalar args: inputs[0] is empty (TABLE placeholder), inputs[1..3] are scalars
+	bind_data->table_name = input.inputs[1].GetValue<string>();
+	bind_data->index_name = input.inputs[2].GetValue<string>();
+	bind_data->k = input.inputs[3].GetValue<int32_t>();
+
+	for (auto &kv : input.named_parameters) {
+		if (kv.first == "search_complexity") {
+			bind_data->search_complexity = kv.second.GetValue<int32_t>();
+		}
+	}
+
+	// Save input table schema
+	bind_data->input_types = input.input_table_types;
+	bind_data->input_names = input.input_table_names;
+
+	// Find the vector column: first LIST or ARRAY with numeric child (FLOAT, DOUBLE, DECIMAL, etc.)
+	bind_data->vector_col_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
+		auto &type = input.input_table_types[i];
+		if (type.id() == LogicalTypeId::LIST) {
+			auto child = ListType::GetChildType(type).id();
+			if (child == LogicalTypeId::FLOAT || child == LogicalTypeId::DOUBLE || child == LogicalTypeId::DECIMAL ||
+			    child == LogicalTypeId::INTEGER || child == LogicalTypeId::BIGINT || child == LogicalTypeId::SMALLINT ||
+			    child == LogicalTypeId::TINYINT) {
+				bind_data->vector_col_idx = i;
+				break;
+			}
+		}
+		if (type.id() == LogicalTypeId::ARRAY) {
+			auto child = ArrayType::GetChildType(type).id();
+			if (child == LogicalTypeId::FLOAT || child == LogicalTypeId::DOUBLE || child == LogicalTypeId::DECIMAL ||
+			    child == LogicalTypeId::INTEGER || child == LogicalTypeId::BIGINT || child == LogicalTypeId::SMALLINT ||
+			    child == LogicalTypeId::TINYINT) {
+				bind_data->vector_col_idx = i;
+				break;
+			}
+		}
+	}
+	if (bind_data->vector_col_idx == DConstants::INVALID_INDEX) {
+		throw BinderException("ann_search_table: input table must have a numeric LIST or ARRAY column for queries");
+	}
+
+	// Output: input columns + base table columns + _distance
+	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
+		names.push_back(input.input_table_names[i]);
+		return_types.push_back(input.input_table_types[i]);
+	}
+
+	// Collect input column names for dedup
+	unordered_set<string> used_names;
+	for (auto &n : names) {
+		used_names.insert(n);
+	}
+
+	// Look up base table columns — prefix with table name if name conflicts
+	auto &catalog = Catalog::GetCatalog(context, "");
+	auto &duck_table =
+	    catalog.GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, bind_data->table_name).Cast<DuckTableEntry>();
+	auto &columns = duck_table.GetColumns();
+
+	for (auto &col : columns.Physical()) {
+		bind_data->base_column_names.push_back(col.Name());
+		bind_data->base_column_types.push_back(col.Type());
+		bind_data->base_storage_ids.emplace_back(columns.LogicalToPhysical(col.Logical()).index);
+
+		auto col_name = col.Name();
+		if (used_names.count(col_name)) {
+			col_name = bind_data->table_name + "_" + col_name;
+		}
+		used_names.insert(col_name);
+		names.push_back(col_name);
+		return_types.push_back(col.Type());
+	}
+
+	names.push_back("_distance");
+	return_types.push_back(LogicalType::FLOAT);
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> AnnSearchTableGlobalInit(ClientContext &context,
+                                                                     TableFunctionInitInput &input) {
+	return make_uniq<AnnSearchTableGlobalState>();
+}
+
+static unique_ptr<LocalTableFunctionState> AnnSearchTableLocalInit(ExecutionContext &context,
+                                                                   TableFunctionInitInput &input,
+                                                                   GlobalTableFunctionState *global_state) {
+	return make_uniq<AnnSearchTableLocalState>();
+}
+
+/// Extract float vectors from a DataChunk column (LIST or ARRAY of FLOAT).
+static vector<vector<float>> ExtractVectors(DataChunk &input, idx_t col_idx) {
+	vector<vector<float>> result;
+	auto count = input.size();
+	result.reserve(count);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto val = input.data[col_idx].GetValue(i);
+		if (val.IsNull()) {
+			result.emplace_back();
+			continue;
+		}
+		auto &children = ListValue::GetChildren(val);
+		vector<float> vec;
+		vec.reserve(children.size());
+		for (auto &v : children) {
+			vec.push_back(v.GetValue<float>());
+		}
+		result.push_back(std::move(vec));
+	}
+	return result;
+}
+
+static OperatorResultType AnnSearchTableInOut(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
+                                              DataChunk &output) {
+	auto &bind = data.bind_data->Cast<AnnSearchTableBindData>();
+	auto &lstate = data.local_state->Cast<AnnSearchTableLocalState>();
+	auto &client = context.client;
+
+	// Process input chunk if not yet done
+	if (!lstate.processed) {
+		lstate.results.clear();
+		lstate.emit_offset = 0;
+
+		auto queries = ExtractVectors(input, bind.vector_col_idx);
+
+		// Find the DiskANN index
+		auto &catalog = Catalog::GetCatalog(client, "");
+		auto &duck_table =
+		    catalog.GetEntry<TableCatalogEntry>(client, DEFAULT_SCHEMA, bind.table_name).Cast<DuckTableEntry>();
+		auto &storage = duck_table.GetStorage();
+		auto &table_info = *storage.GetDataTableInfo();
+		auto &indexes = table_info.GetIndexes();
+
+		indexes.Bind(client, table_info, DiskannIndex::TYPE_NAME);
+#ifdef FAISS_AVAILABLE
+		indexes.Bind(client, table_info, FaissIndex::TYPE_NAME);
+#endif
+
+		auto idx_ptr = indexes.Find(bind.index_name);
+		if (!idx_ptr) {
+			throw InvalidInputException("ANN index '%s' not found on table '%s'", bind.index_name, bind.table_name);
+		}
+
+		auto *diskann = dynamic_cast<DiskannIndex *>(idx_ptr.get());
+		if (diskann) {
+			auto batch_results = diskann->SearchBatch(queries, bind.k, bind.search_complexity);
+			for (idx_t qi = 0; qi < batch_results.size(); qi++) {
+				for (auto &pair : batch_results[qi]) {
+					lstate.results.push_back({qi, pair.first, pair.second});
+				}
+			}
+		}
+#ifdef FAISS_AVAILABLE
+		else {
+			auto *faiss = dynamic_cast<FaissIndex *>(idx_ptr.get());
+			if (faiss) {
+				for (idx_t qi = 0; qi < queries.size(); qi++) {
+					auto results = faiss->Search(queries[qi].data(), static_cast<int32_t>(queries[qi].size()), bind.k);
+					for (auto &pair : results) {
+						lstate.results.push_back({qi, pair.first, pair.second});
+					}
+				}
+			}
+		}
+#endif
+
+		lstate.processed = true;
+	}
+
+	// Emit results
+	auto remaining = lstate.results.size() - lstate.emit_offset;
+	if (remaining == 0) {
+		output.SetCardinality(0);
+		lstate.processed = false;
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	auto batch_size = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+	auto n_input_cols = bind.input_types.size();
+	auto n_base_cols = bind.base_column_types.size();
+
+	// Copy input columns (replicated per result row)
+	for (idx_t col = 0; col < n_input_cols; col++) {
+		for (idx_t i = 0; i < batch_size; i++) {
+			auto input_row = lstate.results[lstate.emit_offset + i].input_row;
+			output.data[col].SetValue(i, input.data[col].GetValue(input_row));
+		}
+	}
+
+	// Fetch base table rows
+	auto &catalog = Catalog::GetCatalog(client, "");
+	auto &duck_table =
+	    catalog.GetEntry<TableCatalogEntry>(client, DEFAULT_SCHEMA, bind.table_name).Cast<DuckTableEntry>();
+	auto &storage = duck_table.GetStorage();
+	auto &transaction = DuckTransaction::Get(client, storage.db);
+
+	Vector row_ids_vec(LogicalType::ROW_TYPE, batch_size);
+	auto row_ids_data = FlatVector::GetData<row_t>(row_ids_vec);
+	for (idx_t i = 0; i < batch_size; i++) {
+		row_ids_data[i] = lstate.results[lstate.emit_offset + i].base_row_id;
+	}
+
+	DataChunk fetch_chunk;
+	fetch_chunk.Initialize(client, bind.base_column_types);
+	ColumnFetchState fetch_state;
+	storage.Fetch(transaction, fetch_chunk, bind.base_storage_ids, row_ids_vec, batch_size, fetch_state);
+
+	for (idx_t col = 0; col < n_base_cols; col++) {
+		for (idx_t i = 0; i < batch_size; i++) {
+			output.data[n_input_cols + col].SetValue(i, fetch_chunk.data[col].GetValue(i));
+		}
+	}
+
+	// Distance column (last)
+	auto dist_col = n_input_cols + n_base_cols;
+	for (idx_t i = 0; i < batch_size; i++) {
+		output.data[dist_col].SetValue(i, Value::FLOAT(lstate.results[lstate.emit_offset + i].distance));
+	}
+
+	output.SetCardinality(batch_size);
+	lstate.emit_offset += batch_size;
+
+	if (lstate.emit_offset >= lstate.results.size()) {
+		lstate.processed = false;
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+	return OperatorResultType::HAVE_MORE_OUTPUT;
+}
+
+static OperatorFinalizeResultType AnnSearchTableFinal(ExecutionContext &context, TableFunctionInput &data,
+                                                      DataChunk &output) {
+	output.SetCardinality(0);
+	return OperatorFinalizeResultType::FINISHED;
+}
+
 void RegisterAnnSearchFunction(ExtensionLoader &loader) {
 	// Single-query search
 	TableFunction func(
@@ -396,6 +699,16 @@ void RegisterAnnSearchFunction(ExtensionLoader &loader) {
 	                         AnnSearchBatchScan, AnnSearchBatchBind, AnnSearchBatchInit);
 	batch_func.named_parameters["search_complexity"] = LogicalType::INTEGER;
 	loader.RegisterFunction(batch_func);
+
+	// Table-input streaming batch search: accepts subqueries, CTEs, generate_series, etc.
+	// Usage: SELECT * FROM ann_search_table((SELECT vec FROM queries), 'base_table', 'idx', 10)
+	TableFunction table_func("ann_search_table",
+	                         {LogicalType::TABLE, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER},
+	                         nullptr, AnnSearchTableBind, AnnSearchTableGlobalInit, AnnSearchTableLocalInit);
+	table_func.in_out_function = AnnSearchTableInOut;
+	table_func.in_out_function_final = AnnSearchTableFinal;
+	table_func.named_parameters["search_complexity"] = LogicalType::INTEGER;
+	loader.RegisterFunction(table_func);
 }
 
 } // namespace duckdb

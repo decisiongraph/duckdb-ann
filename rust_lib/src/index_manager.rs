@@ -141,13 +141,7 @@ impl ManagedIndex {
         search_complexity: u32,
     ) -> Result<Vec<Vec<(u64, f32)>>> {
         match self {
-            ManagedIndex::InMemory(idx) => {
-                // Sequential fallback for in-memory indexes
-                queries
-                    .iter()
-                    .map(|q| idx.search(q, k, search_complexity))
-                    .collect()
-            }
+            ManagedIndex::InMemory(idx) => idx.search_batch(queries, k, search_complexity),
             ManagedIndex::Disk(idx) => idx.search_batch(queries, k, search_complexity),
         }
     }
@@ -384,6 +378,36 @@ impl InMemoryIndex {
 
             Ok(results)
         })
+    }
+
+    /// Multi-query batch search with GPU acceleration.
+    ///
+    /// Uses Provider's lock-step BFS with Metal GPU batch distance when enough
+    /// work accumulates. Falls back to sequential per-query search via the
+    /// DiskANN crate for very small batches (nq < 2).
+    pub fn search_batch(
+        &self,
+        queries: &[&[f32]],
+        k: usize,
+        search_complexity: u32,
+    ) -> Result<Vec<Vec<(u64, f32)>>> {
+        for (i, q) in queries.iter().enumerate() {
+            if q.len() != self.dimension {
+                return Err(anyhow!(
+                    "Query {} dimension {} doesn't match index dimension {}",
+                    i, q.len(), self.dimension
+                ));
+            }
+        }
+
+        let base_l = if search_complexity > 0 {
+            search_complexity as usize
+        } else {
+            self.build_complexity as usize
+        };
+        let l_search = k.max(base_l);
+
+        Ok(self.provider.search_batch(queries, k, l_search, self.metric))
     }
 
     /// Search writing results directly into caller-provided buffers.
