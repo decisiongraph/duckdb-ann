@@ -23,6 +23,12 @@ struct SearchContext {
     visited: hashbrown::HashSet<u32>,
     candidates: BinaryHeap<std::cmp::Reverse<(FloatOrd, u32)>>,
     result: Vec<(f32, u32)>,
+    /// Scratch: unvisited neighbor IDs for current candidate expansion.
+    batch_ids: Vec<u32>,
+    /// Scratch: contiguous candidate vectors for GPU batch distance.
+    batch_buf: Vec<f32>,
+    /// Scratch: output distances from GPU batch distance.
+    batch_dist: Vec<f32>,
 }
 
 impl SearchContext {
@@ -31,6 +37,9 @@ impl SearchContext {
             visited: hashbrown::HashSet::new(),
             candidates: BinaryHeap::new(),
             result: Vec::new(),
+            batch_ids: Vec::new(),
+            batch_buf: Vec::new(),
+            batch_dist: Vec::new(),
         }
     }
 
@@ -38,6 +47,8 @@ impl SearchContext {
         self.visited.clear();
         self.candidates.clear();
         self.result.clear();
+        self.batch_ids.clear();
+        // batch_buf and batch_dist are cleared per-iteration, not here
     }
 }
 
@@ -198,6 +209,10 @@ impl DiskProvider {
     }
 
     /// Greedy best-first search on the mmap'd graph.
+    ///
+    /// When Metal GPU is available and the batch is large enough, neighbor
+    /// distance computations are dispatched to the GPU. Otherwise falls
+    /// back to CPU SIMD distance.
     pub fn search(&self, query: &[f32], k: usize, l_search: usize) -> Vec<(u64, f32)> {
         let n = self.len();
         if n == 0 || k == 0 {
@@ -206,79 +221,146 @@ impl DiskProvider {
 
         let k = k.min(n);
         let l = l_search.max(k);
+        let dim = self.dimension();
+        let metric_code: u8 = match self.metric {
+            Metric::L2 => 0,
+            Metric::InnerProduct => 1,
+        };
 
         SEARCH_CTX.with(|cell| {
             let mut ctx = cell.borrow_mut();
             ctx.clear();
 
+            // Destructure into separate borrows to satisfy borrow checker
+            let SearchContext {
+                ref mut visited,
+                ref mut candidates,
+                ref mut result,
+                ref mut batch_ids,
+                ref mut batch_buf,
+                ref mut batch_dist,
+            } = *ctx;
+
             // Reserve capacity if needed (grows once, reused across queries)
             let needed = l * 2;
-            let cap = ctx.visited.capacity();
+            let cap = visited.capacity();
             if cap < needed {
-                ctx.visited.reserve(needed - cap);
+                visited.reserve(needed - cap);
             }
 
             // Seed with entry points
             for &ep in &self.entry_point_ids {
-                if ctx.visited.insert(ep) {
+                if visited.insert(ep) {
                     let vec = self.get_vector(ep);
                     if vec.is_empty() {
                         continue;
                     }
                     let dist = self.compute_distance(query, vec);
-                    ctx.candidates.push(std::cmp::Reverse((FloatOrd(dist), ep)));
-                    ctx.result.push((dist, ep));
+                    candidates.push(std::cmp::Reverse((FloatOrd(dist), ep)));
+                    result.push((dist, ep));
                 }
             }
 
-            ctx.result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-            while let Some(std::cmp::Reverse((FloatOrd(c_dist), c_id))) = ctx.candidates.pop() {
-                if ctx.result.len() >= l && c_dist > ctx.result[l - 1].0 {
+            while let Some(std::cmp::Reverse((FloatOrd(c_dist), c_id))) = candidates.pop() {
+                if result.len() >= l && c_dist > result[l - 1].0 {
                     break;
                 }
 
+                // Collect unvisited neighbors for this candidate
+                batch_ids.clear();
                 for &neighbor in self.get_neighbors(c_id) {
                     if neighbor >= self.header.num_vectors {
                         continue;
                     }
-                    if !ctx.visited.insert(neighbor) {
+                    if !visited.insert(neighbor) {
                         continue;
                     }
-
                     let vec = self.get_vector(neighbor);
                     if vec.is_empty() {
                         continue;
                     }
-                    let dist = self.compute_distance(query, vec);
+                    batch_ids.push(neighbor);
+                }
 
-                    if ctx.result.len() < l || dist < ctx.result[ctx.result.len() - 1].0 {
-                        let pos = ctx
-                            .result
-                            .binary_search_by(|probe| {
-                                probe
-                                    .0
-                                    .partial_cmp(&dist)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                            .unwrap_or_else(|e| e);
-                        ctx.result.insert(pos, (dist, neighbor));
-                        if ctx.result.len() > l {
-                            ctx.result.truncate(l);
-                        }
+                if batch_ids.is_empty() {
+                    continue;
+                }
 
-                        ctx.candidates
-                            .push(std::cmp::Reverse((FloatOrd(dist), neighbor)));
+                let batch_n = batch_ids.len();
+
+                // Try Metal GPU batch distance when worthwhile
+                let use_gpu = batch_n * dim >= crate::metal_ffi::MIN_GPU_WORK;
+                if use_gpu {
+                    // Gather vectors into contiguous buffer
+                    batch_buf.clear();
+                    batch_buf.reserve(batch_n * dim);
+                    for i in 0..batch_n {
+                        batch_buf.extend_from_slice(self.get_vector(batch_ids[i]));
                     }
+                    batch_dist.resize(batch_n, 0.0);
+
+                    let gpu_ok = crate::metal_ffi::metal_batch_distances(
+                        query,
+                        batch_buf,
+                        batch_n,
+                        dim,
+                        metric_code,
+                        batch_dist,
+                    );
+
+                    if gpu_ok {
+                        for i in 0..batch_n {
+                            let dist = batch_dist[i];
+                            let neighbor = batch_ids[i];
+                            Self::insert_result(result, candidates, l, dist, neighbor);
+                        }
+                        continue;
+                    }
+                }
+
+                // CPU fallback: compute distances individually
+                for i in 0..batch_n {
+                    let neighbor = batch_ids[i];
+                    let vec = self.get_vector(neighbor);
+                    let dist = self.compute_distance(query, vec);
+                    Self::insert_result(result, candidates, l, dist, neighbor);
                 }
             }
 
-            ctx.result
+            result
                 .iter()
                 .take(k)
                 .map(|&(dist, id)| (id as u64, dist))
                 .collect()
         })
+    }
+
+    /// Insert a distance result into the sorted result list and candidate heap.
+    #[inline]
+    fn insert_result(
+        result: &mut Vec<(f32, u32)>,
+        candidates: &mut BinaryHeap<std::cmp::Reverse<(FloatOrd, u32)>>,
+        l: usize,
+        dist: f32,
+        neighbor: u32,
+    ) {
+        if result.len() < l || dist < result[result.len() - 1].0 {
+            let pos = result
+                .binary_search_by(|probe| {
+                    probe
+                        .0
+                        .partial_cmp(&dist)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or_else(|e| e);
+            result.insert(pos, (dist, neighbor));
+            if result.len() > l {
+                result.truncate(l);
+            }
+            candidates.push(std::cmp::Reverse((FloatOrd(dist), neighbor)));
+        }
     }
 
     fn compute_distance(&self, a: &[f32], b: &[f32]) -> f32 {
