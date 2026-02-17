@@ -1,0 +1,108 @@
+# name: test/sql/diskann_sq8_persist.test
+# description: Test SQ8 quantized DiskANN index persistence
+# group: [diskann]
+
+require annsearch
+
+load __TEST_DIR__/diskann_sq8_persist.db
+
+# ========================================
+# Session 1: Create SQ8 index and verify
+# ========================================
+
+statement ok
+CREATE TABLE vectors (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vectors VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]),
+  (4, [0.5, 0.5, 0.0]);
+
+statement ok
+CREATE INDEX sq8_idx ON vectors USING DISKANN (embedding) WITH (quantization = 'sq8');
+
+# Verify quantized flag
+query I
+SELECT quantized FROM annsearch_index_info() WHERE name = 'sq8_idx';
+----
+true
+
+# Search works before checkpoint
+query I
+SELECT v.id
+FROM diskann_index_scan('vectors', 'sq8_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vectors v ON v.rowid = s.row_id;
+----
+1
+
+statement ok
+CHECKPOINT;
+
+# ========================================
+# Session 2: SQ8 index survives restart
+# ========================================
+
+restart
+
+# Index still visible
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'sq8_idx';
+----
+1
+
+# Still quantized after restore
+query I
+SELECT quantized FROM annsearch_index_info() WHERE name = 'sq8_idx';
+----
+true
+
+# Search still works
+query I
+SELECT v.id
+FROM diskann_index_scan('vectors', 'sq8_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vectors v ON v.rowid = s.row_id;
+----
+1
+
+# Insert after restart
+statement ok
+INSERT INTO vectors VALUES (5, [0.95, 0.05, 0.0]);
+
+query I
+SELECT v.id
+FROM diskann_index_scan('vectors', 'sq8_idx', [1.0, 0.0, 0.0], 2) s
+JOIN vectors v ON v.rowid = s.row_id
+ORDER BY s.distance
+LIMIT 2;
+----
+1
+5
+
+# Delete + SQ8 interaction
+statement ok
+DELETE FROM vectors WHERE id = 1;
+
+query I
+SELECT v.id
+FROM diskann_index_scan('vectors', 'sq8_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vectors v ON v.rowid = s.row_id;
+----
+5
+
+statement ok
+CHECKPOINT;
+
+# ========================================
+# Session 3: Delete + SQ8 persists
+# ========================================
+
+restart
+
+query I
+SELECT v.id
+FROM diskann_index_scan('vectors', 'sq8_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vectors v ON v.rowid = s.row_id;
+----
+5

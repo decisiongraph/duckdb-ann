@@ -1,0 +1,135 @@
+# name: test/sql/faiss_ivfflat.test
+# description: Test FAISS IVFFlat index type with training, nprobe, description
+# group: [faiss]
+
+require annsearch
+
+# ========================================
+# IVFFlat with ivf_nlist and nprobe
+# ========================================
+
+statement ok
+CREATE TABLE vecs (id INT, embedding FLOAT[3]);
+
+# Need enough vectors for IVF training (nlist=2 requires >=2 centroids)
+statement ok
+INSERT INTO vecs VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.9, 0.1, 0.0]),
+  (3, [0.0, 1.0, 0.0]),
+  (4, [0.0, 0.9, 0.1]),
+  (5, [0.0, 0.0, 1.0]),
+  (6, [0.1, 0.0, 0.9]),
+  (7, [0.5, 0.5, 0.0]),
+  (8, [0.0, 0.5, 0.5]),
+  (9, [0.5, 0.0, 0.5]),
+  (10, [0.33, 0.33, 0.34]);
+
+statement ok
+CREATE INDEX ivf_idx ON vecs USING FAISS (embedding) WITH (type = 'IVFFlat', ivf_nlist = 2, nprobe = 2);
+
+# Verify index exists
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'ivf_idx';
+----
+1
+
+# IVFFlat search: nearest to [1,0,0] should be id=1
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('vecs', 'ivf_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+# Top-3 nearest to [1,0,0]
+query I
+SELECT v.id
+FROM faiss_index_scan('vecs', 'ivf_idx', [1.0, 0.0, 0.0], 3) s
+JOIN vecs v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1
+2
+7
+
+statement ok
+DROP INDEX ivf_idx;
+
+# ========================================
+# IVFFlat with train_sample
+# ========================================
+
+statement ok
+CREATE INDEX ivf_sample_idx ON vecs USING FAISS (embedding) WITH (type = 'IVFFlat', ivf_nlist = 2, nprobe = 2, train_sample = 5);
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('vecs', 'ivf_sample_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+DROP INDEX ivf_sample_idx;
+
+# ========================================
+# FAISS description parameter (index_factory string)
+# ========================================
+
+statement ok
+CREATE INDEX factory_idx ON vecs USING FAISS (embedding) WITH (description = 'Flat');
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('vecs', 'factory_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+DROP INDEX factory_idx;
+
+# ========================================
+# IVFFlat persistence
+# ========================================
+
+load __TEST_DIR__/faiss_ivf_persist.db
+
+statement ok
+CREATE TABLE pvecs (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO pvecs VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]),
+  (4, [0.5, 0.5, 0.0]),
+  (5, [0.0, 0.5, 0.5]),
+  (6, [0.5, 0.0, 0.5]);
+
+statement ok
+CREATE INDEX ivf_persist ON pvecs USING FAISS (embedding) WITH (type = 'IVFFlat', ivf_nlist = 2, nprobe = 2);
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('pvecs', 'ivf_persist', [1.0, 0.0, 0.0], 1) s
+JOIN pvecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('pvecs', 'ivf_persist', [1.0, 0.0, 0.0], 1) s
+JOIN pvecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+# Clean up
+statement ok
+DROP TABLE pvecs;

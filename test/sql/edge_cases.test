@@ -1,0 +1,306 @@
+# name: test/sql/edge_cases.test
+# description: Edge cases and error handling for DISKANN and FAISS indexes
+# group: [annsearch]
+
+require annsearch
+
+# ========================================
+# Single-dimension vectors: FLOAT[1]
+# ========================================
+
+statement ok
+CREATE TABLE dim1 (id INT, val FLOAT[1]);
+
+statement ok
+INSERT INTO dim1 VALUES (1, [1.0]), (2, [5.0]), (3, [3.0]);
+
+statement ok
+CREATE INDEX dim1_idx ON dim1 USING DISKANN (val);
+
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('dim1', 'dim1_idx', [2.0], 2) s
+JOIN dim1 v ON v.rowid = s.row_id
+ORDER BY s.distance, v.id;
+----
+1	1.0
+3	1.0
+
+statement ok
+DROP INDEX dim1_idx;
+
+statement ok
+CREATE INDEX dim1_faiss ON dim1 USING FAISS (val);
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('dim1', 'dim1_faiss', [2.0], 1) s
+JOIN dim1 v ON v.rowid = s.row_id;
+----
+1	1.0
+
+statement ok
+DROP TABLE dim1;
+
+# ========================================
+# Identical vectors — multiple rows, same embedding
+# ========================================
+
+statement ok
+CREATE TABLE dupes (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO dupes VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [1.0, 0.0, 0.0]),
+  (3, [1.0, 0.0, 0.0]),
+  (4, [0.0, 1.0, 0.0]);
+
+statement ok
+CREATE INDEX dupes_idx ON dupes USING DISKANN (embedding);
+
+# Should return 3 results at distance 0
+query I
+SELECT count(*)
+FROM diskann_index_scan('dupes', 'dupes_idx', [1.0, 0.0, 0.0], 4) s
+JOIN dupes v ON v.rowid = s.row_id
+WHERE s.distance < 0.01;
+----
+3
+
+statement ok
+DROP INDEX dupes_idx;
+
+statement ok
+CREATE INDEX dupes_faiss ON dupes USING FAISS (embedding);
+
+query I
+SELECT count(*)
+FROM faiss_index_scan('dupes', 'dupes_faiss', [1.0, 0.0, 0.0], 4) s
+JOIN dupes v ON v.rowid = s.row_id
+WHERE s.distance < 0.01;
+----
+3
+
+statement ok
+DROP TABLE dupes;
+
+# ========================================
+# k > number of vectors — should return all available
+# ========================================
+
+statement ok
+CREATE TABLE small (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO small VALUES (1, [1.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0]);
+
+statement ok
+CREATE INDEX small_idx ON small USING FAISS (embedding);
+
+# Request k=100 but only 2 vectors exist
+query I
+SELECT count(*) FROM faiss_index_scan('small', 'small_idx', [1.0, 0.0, 0.0], 100);
+----
+2
+
+statement ok
+DROP TABLE small;
+
+# ========================================
+# Wrong table or index name — error handling
+# ========================================
+
+statement ok
+CREATE TABLE err_t (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO err_t VALUES (1, [1.0, 0.0, 0.0]);
+
+statement ok
+CREATE INDEX err_idx ON err_t USING FAISS (embedding);
+
+# Non-existent index name
+statement error
+SELECT * FROM faiss_index_scan('err_t', 'nonexistent', [1.0, 0.0, 0.0], 1);
+----
+FAISS index 'nonexistent' not found
+
+# Non-existent table name
+statement error
+SELECT * FROM faiss_index_scan('no_such_table', 'err_idx', [1.0, 0.0, 0.0], 1);
+----
+Catalog Error
+
+# Non-existent index in ann_search
+statement error
+SELECT * FROM ann_search('err_t', 'nonexistent', [1.0, 0.0, 0.0]::FLOAT[3], 1);
+----
+not found
+
+# Non-existent table in ann_search
+statement error
+SELECT * FROM ann_search('no_such_table', 'err_idx', [1.0, 0.0, 0.0]::FLOAT[3], 1);
+----
+Catalog Error
+
+statement ok
+DROP TABLE err_t;
+
+# ========================================
+# Wrong column type — must be FLOAT[N]
+# ========================================
+
+statement ok
+CREATE TABLE wrong_type (id INT, data VARCHAR);
+
+statement ok
+INSERT INTO wrong_type VALUES (1, 'hello');
+
+statement error
+CREATE INDEX bad_idx ON wrong_type USING DISKANN (data);
+----
+must be FLOAT[N]
+
+statement error
+CREATE INDEX bad_idx ON wrong_type USING FAISS (data);
+----
+must be FLOAT[N]
+
+statement ok
+DROP TABLE wrong_type;
+
+# ========================================
+# Constraint violation — no UNIQUE or PK
+# ========================================
+
+statement ok
+CREATE TABLE constr_t (id INT, embedding FLOAT[3]);
+
+statement error
+CREATE UNIQUE INDEX unique_idx ON constr_t USING DISKANN (embedding);
+----
+do not support unique
+
+statement error
+CREATE UNIQUE INDEX unique_idx ON constr_t USING FAISS (embedding);
+----
+do not support unique
+
+statement ok
+DROP TABLE constr_t;
+
+# ========================================
+# Multiple indexes on same column (DISKANN + FAISS)
+# ========================================
+
+statement ok
+CREATE TABLE multi (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO multi VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]);
+
+statement ok
+CREATE INDEX multi_diskann ON multi USING DISKANN (embedding);
+
+statement ok
+CREATE INDEX multi_faiss ON multi USING FAISS (embedding);
+
+# Both should be visible
+query I
+SELECT count(*) FROM annsearch_list();
+----
+2
+
+# Both should return same nearest neighbor
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('multi', 'multi_diskann', [1.0, 0.0, 0.0], 1) s
+JOIN multi v ON v.rowid = s.row_id;
+----
+1	0.0
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('multi', 'multi_faiss', [1.0, 0.0, 0.0], 1) s
+JOIN multi v ON v.rowid = s.row_id;
+----
+1	0.0
+
+# ann_search uses whichever index is named
+query II
+SELECT id, _distance
+FROM ann_search('multi', 'multi_diskann', [1.0, 0.0, 0.0]::FLOAT[3], 1);
+----
+1	0.0
+
+query II
+SELECT id, _distance
+FROM ann_search('multi', 'multi_faiss', [1.0, 0.0, 0.0]::FLOAT[3], 1);
+----
+1	0.0
+
+# Drop both
+statement ok
+DROP INDEX multi_diskann;
+
+statement ok
+DROP INDEX multi_faiss;
+
+statement ok
+DROP TABLE multi;
+
+# ========================================
+# Zero vector — all zeros
+# ========================================
+
+statement ok
+CREATE TABLE zeros (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO zeros VALUES
+  (1, [0.0, 0.0, 0.0]),
+  (2, [1.0, 0.0, 0.0]);
+
+statement ok
+CREATE INDEX zeros_idx ON zeros USING FAISS (embedding);
+
+# Searching for zero vector should find id=1 at distance 0
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('zeros', 'zeros_idx', [0.0, 0.0, 0.0], 1) s
+JOIN zeros v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+DROP TABLE zeros;
+
+# ========================================
+# Drop table with indexes — cleanup
+# ========================================
+
+statement ok
+CREATE TABLE drop_test (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO drop_test VALUES (1, [1.0, 0.0, 0.0]);
+
+statement ok
+CREATE INDEX drop_diskann ON drop_test USING DISKANN (embedding);
+
+statement ok
+CREATE INDEX drop_faiss ON drop_test USING FAISS (embedding);
+
+# Drop table cascades to indexes
+statement ok
+DROP TABLE drop_test;
+
+# No ANN indexes should remain
+query I
+SELECT count(*) FROM annsearch_list();
+----
+0

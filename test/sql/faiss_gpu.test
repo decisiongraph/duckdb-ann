@@ -1,0 +1,114 @@
+# name: test/sql/faiss_gpu.test
+# description: Test FAISS GPU info function and gpu=true/false flag
+# group: [faiss]
+
+require annsearch
+
+# ========================================
+# faiss_gpu_info() always returns a row
+# ========================================
+
+query II
+SELECT typeof(available), typeof(device) FROM faiss_gpu_info();
+----
+BOOLEAN	VARCHAR
+
+# available is either true or false
+query I
+SELECT available IN (true, false) FROM faiss_gpu_info();
+----
+true
+
+# device is a non-empty string
+query I
+SELECT length(device) > 0 FROM faiss_gpu_info();
+----
+true
+
+# ========================================
+# gpu=false (default) — should work everywhere
+# ========================================
+
+statement ok
+CREATE TABLE vecs (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vecs VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]);
+
+statement ok
+CREATE INDEX cpu_idx ON vecs USING FAISS (embedding) WITH (gpu = false);
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('vecs', 'cpu_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+DROP INDEX cpu_idx;
+
+# ========================================
+# gpu=true — creates GPU-accelerated index (degrades gracefully to CPU)
+# ========================================
+
+statement ok
+CREATE INDEX gpu_idx ON vecs USING FAISS (embedding) WITH (gpu = true);
+
+# Search should work regardless of GPU availability (falls back to CPU)
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('vecs', 'gpu_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+# Insert invalidates GPU copy, search still works
+statement ok
+INSERT INTO vecs VALUES (4, [0.9, 0.1, 0.0]);
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('vecs', 'gpu_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+DROP INDEX gpu_idx;
+
+# ========================================
+# gpu=true persistence — flag survives restart
+# ========================================
+
+load __TEST_DIR__/faiss_gpu_persist.db
+
+statement ok
+CREATE TABLE gpuvecs (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO gpuvecs VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]);
+
+statement ok
+CREATE INDEX gpu_persist ON gpuvecs USING FAISS (embedding) WITH (gpu = true);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Search works after restart even with gpu=true flag
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('gpuvecs', 'gpu_persist', [1.0, 0.0, 0.0], 1) s
+JOIN gpuvecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+DROP TABLE gpuvecs;
