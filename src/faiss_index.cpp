@@ -237,6 +237,12 @@ unique_ptr<GlobalSinkState> PhysicalCreateFaissIndex::GetGlobalSinkState(ClientC
 		state->index_type = "Flat";
 	}
 
+	// Pre-reserve based on estimated cardinality to avoid realloc+copy cycles
+	if (estimated_cardinality > 0) {
+		state->all_vectors.reserve(estimated_cardinality * state->dimension);
+		state->all_rowids.reserve(estimated_cardinality);
+	}
+
 	return std::move(state);
 }
 
@@ -443,17 +449,18 @@ ErrorData FaissIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_id
 	row_identifiers.ToUnifiedFormat(count, rowid_format);
 	auto rowid_data = reinterpret_cast<row_t *>(rowid_format.data);
 
+	// Batch add: single FAISS call for the entire chunk
+	auto base_label = faiss_index_->ntotal;
+	faiss_index_->add(static_cast<faiss::idx_t>(count), child_data);
+
+	auto new_size = base_label + static_cast<int64_t>(count);
+	if (new_size > static_cast<int64_t>(label_to_rowid_.size())) {
+		label_to_rowid_.resize(new_size, -1);
+	}
 	for (idx_t i = 0; i < count; i++) {
 		auto row_idx = rowid_format.sel->get_index(i);
 		auto row_id = rowid_data[row_idx];
-		const float *vec_ptr = child_data + i * array_size;
-
-		auto label = faiss_index_->ntotal;
-		faiss_index_->add(1, vec_ptr);
-
-		if (label >= static_cast<int64_t>(label_to_rowid_.size())) {
-			label_to_rowid_.resize(label + 1, -1);
-		}
+		auto label = base_label + static_cast<int64_t>(i);
 		label_to_rowid_[label] = row_id;
 		rowid_to_label_[row_id] = label;
 	}
@@ -508,6 +515,8 @@ void FaissIndex::CommitDrop(IndexLock &lock) {
 // Serialization
 // ========================================
 
+static constexpr uint32_t FAISS_STORAGE_VERSION = 1;
+
 void FaissIndex::PersistToDisk() {
 	if (!is_dirty_ || !faiss_index_) {
 		return;
@@ -527,6 +536,9 @@ void FaissIndex::PersistToDisk() {
 
 	LinkedBlockWriter writer(*block_allocator_, root_block_ptr_);
 	writer.Reset();
+
+	// Write version header
+	writer.Write(reinterpret_cast<const uint8_t *>(&FAISS_STORAGE_VERSION), sizeof(uint32_t));
 
 	// Write FAISS serialized data
 	writer.Write(reinterpret_cast<const uint8_t *>(&faiss_len), sizeof(uint64_t));
@@ -577,6 +589,15 @@ void FaissIndex::LoadFromStorage(const IndexStorageInfo &info) {
 	block_allocator_->Init(info.allocator_infos[0]);
 
 	LinkedBlockReader reader(*block_allocator_, root_block_ptr_);
+
+	// Read and validate version header
+	uint32_t version = 0;
+	reader.Read(reinterpret_cast<uint8_t *>(&version), sizeof(uint32_t));
+	if (version != FAISS_STORAGE_VERSION) {
+		throw IOException("FAISS index storage version mismatch: found %u, expected %u. "
+		                  "Drop and recreate the index.",
+		                  version, FAISS_STORAGE_VERSION);
+	}
 
 	// Read FAISS serialized data
 	uint64_t faiss_len = 0;
@@ -713,6 +734,12 @@ vector<pair<row_t, float>> FaissIndex::Search(const float *query, int32_t dimens
 	tl_distances.resize(request_k);
 
 	search_index->search(1, query, request_k, tl_distances.data(), tl_labels.data());
+
+	// Shrink thread-local buffers if a previous large request inflated them
+	if (tl_labels.capacity() > 4096 && request_k < 1024) {
+		tl_labels.shrink_to_fit();
+		tl_distances.shrink_to_fit();
+	}
 
 	vector<pair<row_t, float>> results;
 	results.reserve(k);

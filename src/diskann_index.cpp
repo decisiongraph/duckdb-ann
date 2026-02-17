@@ -414,6 +414,8 @@ void DiskannIndex::CommitDrop(IndexLock &lock) {
 // Serialization
 // ========================================
 
+static constexpr uint32_t DISKANN_STORAGE_VERSION = 1;
+
 void DiskannIndex::PersistToDisk() {
 	if (!is_dirty_ || !rust_handle_) {
 		return;
@@ -431,6 +433,9 @@ void DiskannIndex::PersistToDisk() {
 
 	LinkedBlockWriter writer(*block_allocator_, root_block_ptr_);
 	writer.Reset();
+
+	// Write version header
+	writer.Write(reinterpret_cast<const uint8_t *>(&DISKANN_STORAGE_VERSION), sizeof(uint32_t));
 
 	writer.Write(reinterpret_cast<const uint8_t *>(&diskann_len), sizeof(uint64_t));
 	writer.Write(serialized.data, serialized.len);
@@ -469,6 +474,15 @@ void DiskannIndex::LoadFromStorage(const IndexStorageInfo &info) {
 	block_allocator_->Init(info.allocator_infos[0]);
 
 	LinkedBlockReader reader(*block_allocator_, root_block_ptr_);
+
+	// Read and validate version header
+	uint32_t version = 0;
+	reader.Read(reinterpret_cast<uint8_t *>(&version), sizeof(uint32_t));
+	if (version != DISKANN_STORAGE_VERSION) {
+		throw IOException("DiskANN index storage version mismatch: found %u, expected %u. "
+		                  "Drop and recreate the index.",
+		                  version, DISKANN_STORAGE_VERSION);
+	}
 
 	uint64_t diskann_len = 0;
 	reader.Read(reinterpret_cast<uint8_t *>(&diskann_len), sizeof(uint64_t));
@@ -567,6 +581,12 @@ vector<pair<row_t, float>> DiskannIndex::Search(const float *query, int32_t dime
 
 	auto n = DiskannDetachedSearch(rust_handle_, query, dimension, request_k, search_complexity, tl_labels.data(),
 	                               tl_distances.data());
+
+	// Shrink thread-local buffers if a previous large request inflated them
+	if (tl_labels.capacity() > 4096 && request_k < 1024) {
+		tl_labels.shrink_to_fit();
+		tl_distances.shrink_to_fit();
+	}
 
 	vector<pair<row_t, float>> results;
 	results.reserve(k);
