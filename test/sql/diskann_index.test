@@ -1,0 +1,151 @@
+# name: test/sql/diskann_index.test
+# description: Test DISKANN BoundIndex (CREATE INDEX ... USING DISKANN)
+# group: [diskann]
+
+require annsearch
+
+# ========================================
+# Basic CREATE INDEX
+# ========================================
+
+statement ok
+CREATE TABLE vectors (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vectors VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]),
+  (4, [0.5, 0.5, 0.0]),
+  (5, [0.0, 0.5, 0.5]);
+
+statement ok
+CREATE INDEX idx_emb ON vectors USING DISKANN (embedding);
+
+# Verify index exists in catalog
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_emb';
+----
+1
+
+# Verify index metadata
+query III
+SELECT index_name, table_name, is_unique FROM duckdb_indexes() WHERE index_name = 'idx_emb';
+----
+idx_emb	vectors	false
+
+# ========================================
+# INSERT after index creation
+# ========================================
+
+statement ok
+INSERT INTO vectors VALUES (6, [0.3, 0.3, 0.3]);
+
+query I
+SELECT count(*) FROM vectors;
+----
+6
+
+# Multi-row insert
+statement ok
+INSERT INTO vectors VALUES (7, [0.1, 0.9, 0.0]), (8, [0.0, 0.1, 0.9]);
+
+query I
+SELECT count(*) FROM vectors;
+----
+8
+
+# ========================================
+# DELETE with index
+# ========================================
+
+statement ok
+DELETE FROM vectors WHERE id = 4;
+
+query I
+SELECT count(*) FROM vectors;
+----
+7
+
+# Verify correct row was deleted
+query I
+SELECT id FROM vectors WHERE id = 4;
+----
+
+# ========================================
+# DROP INDEX
+# ========================================
+
+statement ok
+DROP INDEX idx_emb;
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_emb';
+----
+0
+
+# Table still works after dropping index
+query I
+SELECT count(*) FROM vectors;
+----
+7
+
+# ========================================
+# CREATE INDEX with options
+# ========================================
+
+statement ok
+CREATE INDEX idx_emb2 ON vectors USING DISKANN (embedding) WITH (max_degree=32, build_complexity=100, alpha=1.0);
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_emb2';
+----
+1
+
+statement ok
+DROP INDEX idx_emb2;
+
+# ========================================
+# IF NOT EXISTS
+# ========================================
+
+statement ok
+CREATE INDEX idx_emb3 ON vectors USING DISKANN (embedding);
+
+statement ok
+CREATE INDEX IF NOT EXISTS idx_emb3 ON vectors USING DISKANN (embedding);
+
+# Should error without IF NOT EXISTS
+statement error
+CREATE INDEX idx_emb3 ON vectors USING DISKANN (embedding);
+----
+already exists
+
+statement ok
+DROP INDEX idx_emb3;
+
+# ========================================
+# Error cases
+# ========================================
+
+# Wrong column type
+statement ok
+CREATE TABLE wrong_type (id INT, name VARCHAR);
+
+statement error
+CREATE INDEX bad_idx ON wrong_type USING DISKANN (name);
+----
+FLOAT[N]
+
+# Multiple columns not supported
+statement error
+CREATE INDEX bad_idx ON vectors USING DISKANN (id, embedding);
+----
+exactly one column
+
+# Cleanup
+statement ok
+DROP TABLE vectors;
+
+statement ok
+DROP TABLE wrong_type;

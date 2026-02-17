@@ -12,23 +12,23 @@ public:
 };
 
 // DiskANN function registration (always available)
-void RegisterDiskannCreateFunction(ExtensionLoader &loader);
-void RegisterDiskannDestroyFunction(ExtensionLoader &loader);
-void RegisterDiskannAddFunction(ExtensionLoader &loader);
-void RegisterDiskannSearchFunction(ExtensionLoader &loader);
-void RegisterDiskannListFunction(ExtensionLoader &loader);
-void RegisterDiskannInfoFunction(ExtensionLoader &loader);
+void RegisterDiskannIndexScanFunction(ExtensionLoader &loader);
+void RegisterDiskannStreamingBuildFunction(ExtensionLoader &loader);
+
+// Convenience search (works with both DISKANN and FAISS indexes)
+void RegisterAnnSearchFunction(ExtensionLoader &loader);
 
 // Unified listing
 void RegisterAnnsearchListFunction(ExtensionLoader &loader);
 
+// Optimizer: ORDER BY array_distance(...) LIMIT k → ANN index scan
+void RegisterAnnOptimizer(DatabaseInstance &db);
+
 #ifdef FAISS_AVAILABLE
-// FAISS function registration (conditional on libfaiss)
-void RegisterFaissCreateFunction(ExtensionLoader &loader);
-void RegisterFaissAddFunction(ExtensionLoader &loader);
-void RegisterFaissSearchFunction(ExtensionLoader &loader);
-void RegisterFaissPersistFunctions(ExtensionLoader &loader);
-void RegisterFaissManageFunctions(ExtensionLoader &loader);
+// FAISS BoundIndex scan function
+void RegisterFaissIndexScanFunction(ExtensionLoader &loader);
+
+// FAISS GPU info
 void RegisterFaissGpuFunctions(ExtensionLoader &loader);
 #endif
 

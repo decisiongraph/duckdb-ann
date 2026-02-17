@@ -1,0 +1,124 @@
+# name: test/sql/diskann_advanced.test
+# description: Advanced DiskANN BoundIndex tests: custom params, edge cases, larger dataset
+# group: [diskann]
+
+require annsearch
+
+# ========================================
+# Custom index parameters
+# ========================================
+
+statement ok
+CREATE TABLE custom_vecs (id INT, embedding FLOAT[2]);
+
+statement ok
+INSERT INTO custom_vecs VALUES (1, [1.0, 0.0]), (2, [0.0, 1.0]);
+
+statement ok
+CREATE INDEX custom_idx ON custom_vecs USING DISKANN (embedding)
+WITH (max_degree=32, build_complexity=64, alpha=1.0);
+
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('custom_vecs', 'custom_idx', [1.0, 0.0], 2) s
+JOIN custom_vecs v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.0
+2	2.0
+
+statement ok
+DROP INDEX custom_idx;
+
+statement ok
+DROP TABLE custom_vecs;
+
+# ========================================
+# Edge case: k > n (request more results than vectors)
+# ========================================
+
+statement ok
+CREATE TABLE small_vecs (id INT, embedding FLOAT[2]);
+
+statement ok
+INSERT INTO small_vecs VALUES (1, [1.0, 0.0]), (2, [0.0, 1.0]);
+
+statement ok
+CREATE INDEX small_idx ON small_vecs USING DISKANN (embedding);
+
+# k=10 but only 2 vectors -- should return 2 results
+query I
+SELECT count(*) FROM diskann_index_scan('small_vecs', 'small_idx', [0.5, 0.5], 10);
+----
+2
+
+statement ok
+DROP INDEX small_idx;
+
+statement ok
+DROP TABLE small_vecs;
+
+# ========================================
+# Larger dataset: 10 vectors in 4D
+# ========================================
+
+statement ok
+CREATE TABLE big_vecs (id INT, embedding FLOAT[4]);
+
+statement ok
+INSERT INTO big_vecs VALUES
+  (1, [0.0, 0.0, 0.0, 0.0]),
+  (2, [1.0, 0.0, 0.0, 0.0]),
+  (3, [0.0, 1.0, 0.0, 0.0]),
+  (4, [0.0, 0.0, 1.0, 0.0]),
+  (5, [0.0, 0.0, 0.0, 1.0]),
+  (6, [1.0, 1.0, 0.0, 0.0]),
+  (7, [1.0, 1.0, 1.0, 0.0]),
+  (8, [1.0, 1.0, 1.0, 1.0]),
+  (9, [2.0, 0.0, 0.0, 0.0]),
+  (10, [0.0, 2.0, 0.0, 0.0]);
+
+statement ok
+CREATE INDEX big_idx ON big_vecs USING DISKANN (embedding);
+
+# Search nearest to origin -- id 1 is the origin itself (distance 0)
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('big_vecs', 'big_idx', [0.0, 0.0, 0.0, 0.0], 1) s
+JOIN big_vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+# Search nearest to [1,0,0,0] -- should return id 2 (exact match)
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('big_vecs', 'big_idx', [1.0, 0.0, 0.0, 0.0], 1) s
+JOIN big_vecs v ON v.rowid = s.row_id;
+----
+2	0.0
+
+# Search with search_complexity param
+query I
+SELECT count(*) FROM diskann_index_scan('big_vecs', 'big_idx', [0.0, 0.0, 0.0, 0.0], 5, search_complexity := 200);
+----
+5
+
+# ========================================
+# DELETE support
+# ========================================
+
+statement ok
+DELETE FROM big_vecs WHERE id = 2;
+
+# After deleting id=2 ([1,0,0,0]), nearest to [1,0,0,0] should have distance > 0
+query I
+SELECT s.distance > 0
+FROM diskann_index_scan('big_vecs', 'big_idx', [1.0, 0.0, 0.0, 0.0], 1) s;
+----
+true
+
+statement ok
+DROP INDEX big_idx;
+
+statement ok
+DROP TABLE big_vecs;

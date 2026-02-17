@@ -1,33 +1,60 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "annsearch_extension.hpp"
+#include "diskann_index.hpp"
 #include "duckdb.hpp"
+#include "duckdb/execution/index/index_type.hpp"
+#include "duckdb/execution/index/index_type_set.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/database.hpp"
+
+#ifdef FAISS_AVAILABLE
+#include "faiss_index.hpp"
+#endif
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// DiskANN functions (always available)
-	RegisterDiskannCreateFunction(loader);
-	RegisterDiskannDestroyFunction(loader);
-	RegisterDiskannAddFunction(loader);
-	RegisterDiskannSearchFunction(loader);
-	RegisterDiskannListFunction(loader);
-	RegisterDiskannInfoFunction(loader);
+	auto &db = loader.GetDatabaseInstance();
+
+	// ========================================
+	// Register DISKANN index type
+	// ========================================
+	IndexType diskann_type;
+	diskann_type.name = DiskannIndex::TYPE_NAME;
+	diskann_type.create_instance = DiskannIndex::Create;
+	diskann_type.create_plan = DiskannIndex::CreatePlan;
+	db.config.GetIndexTypes().RegisterIndexType(diskann_type);
+
+	// DiskANN functions
+	RegisterDiskannIndexScanFunction(loader);
+	RegisterDiskannStreamingBuildFunction(loader);
 
 #ifdef FAISS_AVAILABLE
-	// FAISS functions (conditional on libfaiss)
-	RegisterFaissCreateFunction(loader);
-	RegisterFaissAddFunction(loader);
-	RegisterFaissSearchFunction(loader);
-	RegisterFaissPersistFunctions(loader);
-	RegisterFaissManageFunctions(loader);
-#ifdef FAISS_METAL_ENABLED
+	// ========================================
+	// Register FAISS index type
+	// ========================================
+	IndexType faiss_type;
+	faiss_type.name = FaissIndex::TYPE_NAME;
+	faiss_type.create_instance = FaissIndex::Create;
+	faiss_type.create_plan = FaissIndex::CreatePlan;
+	db.config.GetIndexTypes().RegisterIndexType(faiss_type);
+
+	// FAISS BoundIndex search function
+	RegisterFaissIndexScanFunction(loader);
+
+	// FAISS GPU info
 	RegisterFaissGpuFunctions(loader);
 #endif
-#endif
+
+	// Convenience ann_search function (always available)
+	RegisterAnnSearchFunction(loader);
 
 	// Unified listing (always available)
 	RegisterAnnsearchListFunction(loader);
+
+	// Optimizer: ORDER BY array_distance(...) LIMIT k → ANN index scan
+	RegisterAnnOptimizer(db);
 }
 
 void AnnsearchExtension::Load(ExtensionLoader &loader) {

@@ -16,6 +16,10 @@ public:
 		return "No GPU backend available";
 	}
 
+	std::string BackendName() const override {
+		return "cpu";
+	}
+
 	std::unique_ptr<faiss::Index> CpuToGpu(faiss::Index * /*cpu_index*/) override {
 		throw std::runtime_error("No GPU backend available. Build with Metal (macOS) or CUDA (Linux/Windows) support.");
 	}

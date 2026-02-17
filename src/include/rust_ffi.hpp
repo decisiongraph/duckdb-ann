@@ -7,31 +7,79 @@
 namespace duckdb {
 
 // ========================================
-// Rust FFI wrapper functions
+// Detached handle API (for BoundIndex)
 // ========================================
 
-// Index lifecycle
-std::string DiskannCreateIndex(const std::string &name, int32_t dimension, const std::string &metric,
-                               int32_t max_degree, int32_t build_complexity);
+// Opaque handle to a Rust InMemoryIndex
+typedef void *DiskannHandle;
 
-std::string DiskannDestroyIndex(const std::string &name);
+// Create a detached index (not in global registry). Returns handle, throws on error.
+DiskannHandle DiskannCreateDetached(int32_t dimension, const std::string &metric, int32_t max_degree,
+                                    int32_t build_complexity, float alpha);
 
-// Vector operations
-// Returns JSON: {"label": N}
-std::string DiskannAddVector(const std::string &name, const float *vector, int32_t dimension);
+// Free a detached index handle.
+void DiskannFreeDetached(DiskannHandle handle);
 
-// Returns JSON: {"results": [[label, distance], ...]}
-std::string DiskannSearch(const std::string &name, const float *query, int32_t dimension, int32_t k);
+// Add vector to detached index. Returns assigned label.
+int64_t DiskannDetachedAdd(DiskannHandle handle, const float *vector, int32_t dimension);
 
-// Management
-// Returns JSON array of index info objects
-std::string DiskannListIndexes();
+// Search detached index. Returns number of results.
+int32_t DiskannDetachedSearch(DiskannHandle handle, const float *query, int32_t dimension, int32_t k,
+                              int32_t search_complexity, int64_t *out_labels, float *out_distances);
 
-// Returns JSON info object
-std::string DiskannGetInfo(const std::string &name);
+// Get vector count.
+int64_t DiskannDetachedCount(DiskannHandle handle);
 
-// Check availability
-bool IsDiskannRustAvailable();
-std::string GetDiskannRustVersion();
+// Serialize detached index to bytes. Caller must free with DiskannFreeSerializedBytes.
+struct DiskannSerializedData {
+	uint8_t *data;
+	size_t len;
+};
+DiskannSerializedData DiskannDetachedSerialize(DiskannHandle handle);
+
+// Deserialize bytes into a detached index. Returns handle.
+DiskannHandle DiskannDetachedDeserialize(const uint8_t *data, size_t len, float alpha);
+
+// Free serialized bytes.
+void DiskannFreeSerializedBytes(DiskannSerializedData bytes);
+
+// ========================================
+// Compact / vacuum
+// ========================================
+
+struct DiskannCompactResult {
+	DiskannHandle new_handle; // New index (caller owns). Null on error.
+	uint32_t *label_map;      // [old0, new0, old1, new1, ...] pairs
+	size_t map_len;           // Number of pairs
+};
+
+// Compact a detached index by rebuilding without deleted labels.
+// Returns new handle + label map. Old handle is NOT freed.
+DiskannCompactResult DiskannDetachedCompact(DiskannHandle handle, const uint32_t *deleted_labels, size_t num_deleted);
+
+// Free the label map from DiskannDetachedCompact.
+void DiskannFreeLabelMap(uint32_t *map, size_t map_len);
+
+// ========================================
+// Vector accessor (for MergeIndexes)
+// ========================================
+
+// Get a vector by label. Returns dimension copied, or 0 if not found.
+int32_t DiskannDetachedGetVector(DiskannHandle handle, uint32_t label, float *out_vec, int32_t capacity);
+
+// ========================================
+// Streaming build API
+// ========================================
+
+struct DiskannStreamingBuildResult {
+	int32_t num_vectors;
+	int32_t dimension;
+	int32_t sample_size;
+};
+
+// Run two-pass streaming build from binary vectors file to .diskann index file.
+DiskannStreamingBuildResult DiskannStreamingBuild(const std::string &input_path, const std::string &output_path,
+                                                  const std::string &metric, int32_t max_degree,
+                                                  int32_t build_complexity, float alpha, int32_t sample_size);
 
 } // namespace duckdb

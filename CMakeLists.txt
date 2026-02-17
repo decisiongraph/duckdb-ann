@@ -76,6 +76,11 @@ if(ENABLE_RUST_DISKANN)
                 ${RUST_LIB_DIR}/src/lib.rs
                 ${RUST_LIB_DIR}/src/ffi.rs
                 ${RUST_LIB_DIR}/src/index_manager.rs
+                ${RUST_LIB_DIR}/src/provider.rs
+                ${RUST_LIB_DIR}/src/runtime.rs
+                ${RUST_LIB_DIR}/src/file_format.rs
+                ${RUST_LIB_DIR}/src/disk_provider.rs
+                ${RUST_LIB_DIR}/src/streaming_build.rs
         )
 
         add_custom_target(diskann_rust_build DEPENDS ${RUST_LIB_PATH})
@@ -120,17 +125,35 @@ endif()
 
 set(FAISS_METAL_AVAILABLE OFF)
 if(FAISS_AVAILABLE AND APPLE)
-    # Check for faiss-metal library
-    find_library(FAISS_METAL_LIB faiss_metal QUIET)
-    if(FAISS_METAL_LIB)
-        find_library(METAL_FRAMEWORK Metal)
-        find_library(METALKIT_FRAMEWORK MetalKit)
-        if(METAL_FRAMEWORK AND METALKIT_FRAMEWORK)
-            set(FAISS_METAL_AVAILABLE ON)
-            message(STATUS "FAISS Metal GPU: ENABLED")
+    find_library(METAL_FW Metal)
+    find_library(MPS_FW MetalPerformanceShaders)
+    if(METAL_FW AND MPS_FW)
+        set(FAISS_METAL_AVAILABLE ON)
+        enable_language(OBJCXX)
+
+        # Force real macOS SDK for Metal headers (nix apple-sdk lacks them)
+        execute_process(
+            COMMAND /usr/bin/xcrun --sdk macosx --show-sdk-path
+            OUTPUT_VARIABLE REAL_MACOS_SDK
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+        # Build faiss-metal as subdirectory (sibling project)
+        set(FAISS_METAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../faiss-metal")
+        if(EXISTS "${FAISS_METAL_DIR}/CMakeLists.txt")
+            add_subdirectory(${FAISS_METAL_DIR} faiss-metal-build)
+            message(STATUS "FAISS Metal GPU: ENABLED (from ${FAISS_METAL_DIR})")
+        else()
+            message(STATUS "FAISS Metal GPU: DISABLED (faiss-metal not found at ${FAISS_METAL_DIR})")
+            set(FAISS_METAL_AVAILABLE OFF)
         endif()
     else()
-        message(STATUS "FAISS Metal GPU: DISABLED (faiss-metal not found)")
+        message(STATUS "FAISS Metal GPU: DISABLED (Metal frameworks not found)")
+    endif()
+else()
+    if(NOT FAISS_AVAILABLE)
+        message(STATUS "FAISS Metal GPU: DISABLED (FAISS not available)")
+    elseif(NOT APPLE)
+        message(STATUS "FAISS Metal GPU: DISABLED (not macOS)")
     endif()
 endif()
 
@@ -147,20 +170,18 @@ include_directories(src/include)
 # Core sources (always compiled)
 set(EXTENSION_SOURCES
     src/annsearch_extension.cpp
+    src/ann_search.cpp
+    src/ann_optimizer.cpp
     src/diskann_functions.cpp
+    src/diskann_index.cpp
     src/rust_ffi.cpp
     src/annsearch_list.cpp
 )
 
 # FAISS sources (conditionally compiled via #ifdef FAISS_AVAILABLE in each file)
 list(APPEND EXTENSION_SOURCES
-    src/faiss_fn_create.cpp
-    src/faiss_fn_add.cpp
-    src/faiss_fn_search.cpp
-    src/faiss_fn_manage.cpp
-    src/faiss_fn_persist.cpp
+    src/faiss_index.cpp
     src/faiss_fn_gpu.cpp
-    src/faiss_index_manager.cpp
     src/faiss_vector_utils.cpp
     src/gpu_backend_cpu.cpp
 )
@@ -214,11 +235,21 @@ endif()
 
 # Link Metal GPU backend
 if(FAISS_METAL_AVAILABLE)
-    target_link_libraries(${EXTENSION_NAME} ${FAISS_METAL_LIB} ${METAL_FRAMEWORK} ${METALKIT_FRAMEWORK})
-    target_link_libraries(${LOADABLE_EXTENSION_NAME} ${FAISS_METAL_LIB} ${METAL_FRAMEWORK} ${METALKIT_FRAMEWORK})
+    target_link_libraries(${EXTENSION_NAME} faiss_metal
+        "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} faiss_metal
+        "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
 
     target_compile_definitions(${EXTENSION_NAME} PRIVATE FAISS_METAL_ENABLED=1)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE FAISS_METAL_ENABLED=1)
+
+    # Prioritize real SDK framework headers over nix apple-sdk
+    if(REAL_MACOS_SDK)
+        target_compile_options(${EXTENSION_NAME} PRIVATE
+            -iframework ${REAL_MACOS_SDK}/System/Library/Frameworks)
+        target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE
+            -iframework ${REAL_MACOS_SDK}/System/Library/Frameworks)
+    endif()
 endif()
 
 install(

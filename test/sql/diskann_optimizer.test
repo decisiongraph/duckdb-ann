@@ -1,0 +1,52 @@
+# name: test/sql/diskann_optimizer.test
+# description: Test ANN optimizer rewrite (ORDER BY array_distance LIMIT k)
+# group: [diskann]
+
+require annsearch
+
+# Create table with vectors
+statement ok
+CREATE TABLE docs (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO docs VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]),
+  (4, [0.5, 0.5, 0.0]),
+  (5, [0.0, 0.5, 0.5]);
+
+# Create DISKANN index on embedding column
+statement ok
+CREATE INDEX docs_idx ON docs USING DISKANN (embedding);
+
+# ORDER BY array_distance LIMIT k should be rewritten to use index scan
+# The optimizer detects: LIMIT -> ORDER BY -> PROJECTION(array_distance) -> GET
+# and rewrites to use the ANN index scan instead of full table scan
+query IR
+SELECT id, array_distance(embedding, [1.0, 0.0, 0.0]::FLOAT[3]) AS dist
+FROM docs
+ORDER BY dist
+LIMIT 3;
+----
+1	0.0
+4	0.70710677
+5	1.2247449
+
+# Search near [0.5, 0.5, 0.0]
+query IR
+SELECT id, array_distance(embedding, [0.5, 0.5, 0.0]::FLOAT[3]) AS dist
+FROM docs
+ORDER BY dist
+LIMIT 3;
+----
+4	0.0
+1	0.70710677
+2	0.70710677
+
+# Clean up
+statement ok
+DROP INDEX docs_idx;
+
+statement ok
+DROP TABLE docs;

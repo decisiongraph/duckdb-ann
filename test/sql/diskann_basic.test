@@ -1,58 +1,66 @@
 # name: test/sql/diskann_basic.test
-# description: Test basic DiskANN extension functionality
+# description: Test basic DiskANN BoundIndex functionality
 # group: [diskann]
 
 require annsearch
 
-# Create an index
-query I
-SELECT * FROM diskann_create('test_idx', 3);
-----
-Created index 'test_idx' (dim=3, metric=L2, R=64, L=128)
+# Create table with vectors
+statement ok
+CREATE TABLE vectors (id INT, embedding FLOAT[3]);
 
-# List indexes
-query IIIII
-SELECT * FROM diskann_list();
-----
-test_idx	3	0	L2	64
+statement ok
+INSERT INTO vectors VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]);
 
-# Add vectors
-query I
-SELECT diskann_add('test_idx', [1.0, 0.0, 0.0]::FLOAT[]);
-----
-0
+# Create DISKANN index
+statement ok
+CREATE INDEX test_idx ON vectors USING DISKANN (embedding);
 
+# Verify index exists
 query I
-SELECT diskann_add('test_idx', [0.0, 1.0, 0.0]::FLOAT[]);
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'test_idx';
 ----
 1
 
-query I
-SELECT diskann_add('test_idx', [0.0, 0.0, 1.0]::FLOAT[]);
-----
-2
-
-# Verify count
+# Search for nearest to [1,0,0]
 query II
-SELECT key, value FROM diskann_info('test_idx') WHERE key = 'count';
-----
-count	3
-
-# Search for nearest to [1,0,0] -- should return label 0 first
-query II
-SELECT label, distance FROM diskann_search('test_idx', [1.0, 0.0, 0.0]::FLOAT[], 2);
+SELECT row_id, distance FROM diskann_index_scan('vectors', 'test_idx', [1.0, 0.0, 0.0], 2) ORDER BY distance;
 ----
 0	0.0
-1	2.0
+2	2.0
 
-# Destroy
+# Search and JOIN back to table
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('vectors', 'test_idx', [1.0, 0.0, 0.0], 3) s
+JOIN vectors v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.0
+2	2.0
+3	2.0
+
+# Insert more vectors and search again
+statement ok
+INSERT INTO vectors VALUES (4, [0.5, 0.5, 0.0]);
+
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('vectors', 'test_idx', [1.0, 0.0, 0.0], 2) s
+JOIN vectors v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.0
+4	0.5
+
+# Drop index
+statement ok
+DROP INDEX test_idx;
+
+# Verify index is gone
 query I
-SELECT * FROM diskann_destroy('test_idx');
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'test_idx';
 ----
-Destroyed index 'test_idx'
-
-# Verify empty list
-query IIIII
-SELECT * FROM diskann_list();
-----
-
+0

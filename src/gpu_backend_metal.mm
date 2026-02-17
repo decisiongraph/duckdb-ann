@@ -5,8 +5,10 @@
 #ifdef FAISS_METAL_ENABLED
 
 #include <faiss-metal/MetalIndexFlat.h>
+#include <faiss-metal/MetalIndexIVFFlat.h>
 #include <faiss-metal/StandardMetalResources.h>
 #include <faiss/IndexFlat.h>
+#include <faiss/IndexIVFFlat.h>
 
 namespace duckdb {
 
@@ -33,27 +35,42 @@ class MetalGpuBackend : public GpuBackend {
         return "Metal GPU (family=" + std::to_string(caps.metalFamily) + ")";
     }
 
+    std::string BackendName() const override {
+        return "metal";
+    }
+
     std::unique_ptr<faiss::Index> CpuToGpu(faiss::Index *cpu_index) override {
         if (!available_) {
             throw std::runtime_error("Metal GPU backend not available");
         }
 
-        auto *flat = dynamic_cast<faiss::IndexFlat *>(cpu_index);
-        if (!flat) {
-            throw std::runtime_error("Metal GPU currently only supports IndexFlat. "
-                                     "Got a non-Flat index type.");
+        // Try IndexIVFFlat first (it also contains an IndexFlat quantizer)
+        auto *ivfflat = dynamic_cast<faiss::IndexIVFFlat *>(cpu_index);
+        if (ivfflat) {
+            return faiss_metal::index_cpu_to_metal_ivf(resources_, ivfflat);
         }
 
-        return faiss_metal::index_cpu_to_metal(resources_, flat);
+        auto *flat = dynamic_cast<faiss::IndexFlat *>(cpu_index);
+        if (flat) {
+            return faiss_metal::index_cpu_to_metal(resources_, flat);
+        }
+
+        throw std::runtime_error("Metal GPU supports IndexFlat and IndexIVFFlat. "
+                                 "Got an unsupported index type.");
     }
 
     std::unique_ptr<faiss::Index> GpuToCpu(faiss::Index *gpu_index) override {
-        auto *metal_flat = dynamic_cast<faiss_metal::MetalIndexFlat *>(gpu_index);
-        if (!metal_flat) {
-            throw std::runtime_error("Index is not a MetalIndexFlat -- cannot convert to CPU");
+        auto *metal_ivf = dynamic_cast<faiss_metal::MetalIndexIVFFlat *>(gpu_index);
+        if (metal_ivf) {
+            return faiss_metal::index_metal_to_cpu_ivf(metal_ivf);
         }
 
-        return faiss_metal::index_metal_to_cpu(metal_flat);
+        auto *metal_flat = dynamic_cast<faiss_metal::MetalIndexFlat *>(gpu_index);
+        if (metal_flat) {
+            return faiss_metal::index_metal_to_cpu(metal_flat);
+        }
+
+        throw std::runtime_error("Index is not a Metal index -- cannot convert to CPU");
     }
 
   private:

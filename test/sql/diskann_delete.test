@@ -1,0 +1,161 @@
+# name: test/sql/diskann_delete.test
+# description: Comprehensive DELETE tests for DiskANN BoundIndex
+# group: [diskann]
+
+require annsearch
+
+# ========================================
+# Setup: create table with 10 vectors
+# ========================================
+
+statement ok
+CREATE TABLE vecs (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vecs VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]),
+  (4, [0.5, 0.5, 0.0]),
+  (5, [0.0, 0.5, 0.5]),
+  (6, [0.5, 0.0, 0.5]),
+  (7, [0.9, 0.1, 0.0]),
+  (8, [0.0, 0.9, 0.1]),
+  (9, [0.1, 0.0, 0.9]),
+  (10, [0.3, 0.3, 0.3]);
+
+statement ok
+CREATE INDEX del_idx ON vecs USING DISKANN (embedding);
+
+# ========================================
+# Test 1: Delete subset, verify excluded from search
+# ========================================
+
+# id=1 is nearest to [1,0,0] — delete it
+statement ok
+DELETE FROM vecs WHERE id = 1;
+
+# Now nearest to [1,0,0] should be id=7 ([0.9,0.1,0]), not id=1
+query I
+SELECT v.id
+FROM diskann_index_scan('vecs', 'del_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+7
+
+# id=1 should not appear in top-10 results at all
+query I
+SELECT count(*)
+FROM diskann_index_scan('vecs', 'del_idx', [1.0, 0.0, 0.0], 10) s
+JOIN vecs v ON v.rowid = s.row_id
+WHERE v.id = 1;
+----
+0
+
+# ========================================
+# Test 2: Delete multiple vectors
+# ========================================
+
+statement ok
+DELETE FROM vecs WHERE id IN (2, 3);
+
+# Search for [0,1,0] — id=2 was nearest, now should be id=8 ([0,0.9,0.1])
+query I
+SELECT v.id
+FROM diskann_index_scan('vecs', 'del_idx', [0.0, 1.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+8
+
+# Total results should be 7 (10 - 3 deleted)
+query I
+SELECT count(*)
+FROM diskann_index_scan('vecs', 'del_idx', [0.0, 0.0, 0.0], 10) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+7
+
+# ========================================
+# Test 3: Delete all vectors — search returns empty
+# ========================================
+
+statement ok
+DELETE FROM vecs WHERE 1=1;
+
+query I
+SELECT count(*)
+FROM diskann_index_scan('vecs', 'del_idx', [1.0, 0.0, 0.0], 10) s;
+----
+0
+
+# ========================================
+# Test 4: Re-insert after deleting all
+# ========================================
+
+statement ok
+INSERT INTO vecs VALUES
+  (11, [1.0, 0.0, 0.0]),
+  (12, [0.0, 1.0, 0.0]),
+  (13, [0.0, 0.0, 1.0]);
+
+query I
+SELECT v.id
+FROM diskann_index_scan('vecs', 'del_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+11
+
+# ========================================
+# Cleanup for in-memory tests
+# ========================================
+
+statement ok
+DROP INDEX del_idx;
+
+statement ok
+DROP TABLE vecs;
+
+# ========================================
+# Test 5: Delete persists across restart
+# ========================================
+
+load __TEST_DIR__/diskann_delete_persist.db
+
+statement ok
+CREATE TABLE pvecs (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO pvecs VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]);
+
+statement ok
+CREATE INDEX pidx ON pvecs USING DISKANN (embedding);
+
+# Delete id=1, checkpoint, restart
+statement ok
+DELETE FROM pvecs WHERE id = 1;
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# After restart, deleted vector (id=1) should still be excluded
+# id=2 and id=3 are equidistant from [1,0,0] so just verify id=1 is absent
+query I
+SELECT count(*)
+FROM diskann_index_scan('pvecs', 'pidx', [1.0, 0.0, 0.0], 3) s
+JOIN pvecs v ON v.rowid = s.row_id
+WHERE v.id = 1;
+----
+0
+
+# Should have exactly 2 results (only id=2 and id=3 remain)
+query I
+SELECT count(*)
+FROM diskann_index_scan('pvecs', 'pidx', [1.0, 0.0, 0.0], 3) s
+JOIN pvecs v ON v.rowid = s.row_id;
+----
+2

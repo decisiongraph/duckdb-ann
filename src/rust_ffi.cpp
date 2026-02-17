@@ -1,107 +1,176 @@
-// Rust DiskANN FFI wrapper for DuckDB extension
+// Rust DiskANN FFI wrapper for DuckDB extension (detached handle API only)
 
 #include "rust_ffi.hpp"
 #include <string>
 
+// ========================================
 // Rust FFI declarations
+// ========================================
 extern "C" {
-struct DiskannResult {
-	char *json_ptr;
-	char *error_ptr;
+
+// Streaming build FFI
+int32_t diskann_streaming_build_buf(const char *input_path, const char *output_path, const char *metric,
+                                    int32_t max_degree, int32_t build_complexity, float alpha, int32_t sample_size,
+                                    int32_t *out_num_vectors, int32_t *out_dimension, int32_t *out_sample_size,
+                                    char *err_buf, int32_t err_buf_len);
+
+// Detached handle FFI
+struct DiskannBytes {
+	uint8_t *data;
+	size_t len;
 };
 
-DiskannResult diskann_create_index(const char *name, int32_t dimension, const char *metric, int32_t max_degree,
-                                   int32_t build_complexity);
-DiskannResult diskann_destroy_index(const char *name);
-DiskannResult diskann_add_vector(const char *name, const float *vector_ptr, int32_t dimension);
-DiskannResult diskann_search(const char *name, const float *query_ptr, int32_t dimension, int32_t k);
-DiskannResult diskann_list_indexes();
-DiskannResult diskann_get_info(const char *name);
-void diskann_free_result(DiskannResult result);
-const char *diskann_rust_version();
+void *diskann_create_detached(int32_t dimension, const char *metric, int32_t max_degree, int32_t build_complexity,
+                              float alpha, char *err_buf, int32_t err_buf_len);
+
+void diskann_free_detached(void *handle);
+
+int64_t diskann_detached_add(void *handle, const float *vector_ptr, int32_t dimension, char *err_buf,
+                             int32_t err_buf_len);
+
+int32_t diskann_detached_search(void *handle, const float *query_ptr, int32_t dimension, int32_t k,
+                                int32_t search_complexity, int64_t *out_labels, float *out_distances, char *err_buf,
+                                int32_t err_buf_len);
+
+int64_t diskann_detached_count(void *handle);
+
+DiskannBytes diskann_detached_serialize(void *handle, char *err_buf, int32_t err_buf_len);
+
+void *diskann_detached_deserialize(const uint8_t *data, size_t len, float alpha, char *err_buf, int32_t err_buf_len);
+
+void diskann_free_bytes(DiskannBytes bytes);
+
+// Compact / vacuum
+struct DiskannCompactResultFFI {
+	void *new_handle;
+	uint32_t *label_map;
+	size_t map_len;
+};
+
+DiskannCompactResultFFI diskann_detached_compact(void *handle, const uint32_t *deleted_labels, size_t num_deleted,
+                                                 char *err_buf, int32_t err_buf_len);
+
+void diskann_free_label_map(uint32_t *map, size_t map_len);
+
+// Vector accessor
+int32_t diskann_detached_get_vector(void *handle, uint32_t label, float *out_vec, int32_t out_capacity);
 }
 
 namespace duckdb {
 
-// RAII wrapper for DiskannResult
-class RustResult {
-public:
-	explicit RustResult(DiskannResult result) : result_(result) {
-	}
-	~RustResult() {
-		diskann_free_result(result_);
-	}
+constexpr int ERR_BUF_LEN = 512;
 
-	bool HasError() const {
-		return result_.error_ptr != nullptr;
-	}
-	std::string GetError() const {
-		return result_.error_ptr ? std::string(result_.error_ptr) : "";
-	}
-	std::string GetJson() const {
-		return result_.json_ptr ? std::string(result_.json_ptr) : "{}";
-	}
+// ========================================
+// Streaming build wrapper
+// ========================================
 
-private:
-	DiskannResult result_;
-};
-
-std::string DiskannCreateIndex(const std::string &name, int32_t dimension, const std::string &metric,
-                               int32_t max_degree, int32_t build_complexity) {
-	RustResult result(diskann_create_index(name.c_str(), dimension, metric.c_str(), max_degree, build_complexity));
-	if (result.HasError()) {
-		throw std::runtime_error("DiskANN create failed: " + result.GetError());
+DiskannStreamingBuildResult DiskannStreamingBuild(const std::string &input_path, const std::string &output_path,
+                                                  const std::string &metric, int32_t max_degree,
+                                                  int32_t build_complexity, float alpha, int32_t sample_size) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	int32_t out_num_vectors = 0;
+	int32_t out_dimension = 0;
+	int32_t out_sample_size = 0;
+	int32_t rc = diskann_streaming_build_buf(input_path.c_str(), output_path.c_str(), metric.c_str(), max_degree,
+	                                         build_complexity, alpha, sample_size, &out_num_vectors, &out_dimension,
+	                                         &out_sample_size, err_buf, ERR_BUF_LEN);
+	if (rc != 0) {
+		throw std::runtime_error("DiskANN streaming build: " + std::string(err_buf));
 	}
-	return result.GetJson();
+	return {out_num_vectors, out_dimension, out_sample_size};
 }
 
-std::string DiskannDestroyIndex(const std::string &name) {
-	RustResult result(diskann_destroy_index(name.c_str()));
-	if (result.HasError()) {
-		throw std::runtime_error("DiskANN destroy failed: " + result.GetError());
+// ========================================
+// Detached handle wrappers
+// ========================================
+
+DiskannHandle DiskannCreateDetached(int32_t dimension, const std::string &metric, int32_t max_degree,
+                                    int32_t build_complexity, float alpha) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	auto handle =
+	    diskann_create_detached(dimension, metric.c_str(), max_degree, build_complexity, alpha, err_buf, ERR_BUF_LEN);
+	if (!handle) {
+		throw std::runtime_error("DiskANN create detached: " + std::string(err_buf));
 	}
-	return result.GetJson();
+	return handle;
 }
 
-std::string DiskannAddVector(const std::string &name, const float *vector, int32_t dimension) {
-	RustResult result(diskann_add_vector(name.c_str(), vector, dimension));
-	if (result.HasError()) {
-		throw std::runtime_error("DiskANN add failed: " + result.GetError());
+void DiskannFreeDetached(DiskannHandle handle) {
+	diskann_free_detached(handle);
+}
+
+int64_t DiskannDetachedAdd(DiskannHandle handle, const float *vector, int32_t dimension) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	int64_t label = diskann_detached_add(handle, vector, dimension, err_buf, ERR_BUF_LEN);
+	if (label < 0) {
+		throw std::runtime_error("DiskANN detached add: " + std::string(err_buf));
 	}
-	return result.GetJson();
+	return label;
 }
 
-std::string DiskannSearch(const std::string &name, const float *query, int32_t dimension, int32_t k) {
-	RustResult result(diskann_search(name.c_str(), query, dimension, k));
-	if (result.HasError()) {
-		throw std::runtime_error("DiskANN search failed: " + result.GetError());
+int32_t DiskannDetachedSearch(DiskannHandle handle, const float *query, int32_t dimension, int32_t k,
+                              int32_t search_complexity, int64_t *out_labels, float *out_distances) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	int32_t n = diskann_detached_search(handle, query, dimension, k, search_complexity, out_labels, out_distances,
+	                                    err_buf, ERR_BUF_LEN);
+	if (n < 0) {
+		throw std::runtime_error("DiskANN detached search: " + std::string(err_buf));
 	}
-	return result.GetJson();
+	return n;
 }
 
-std::string DiskannListIndexes() {
-	RustResult result(diskann_list_indexes());
-	if (result.HasError()) {
-		throw std::runtime_error("DiskANN list failed: " + result.GetError());
+int64_t DiskannDetachedCount(DiskannHandle handle) {
+	return diskann_detached_count(handle);
+}
+
+DiskannSerializedData DiskannDetachedSerialize(DiskannHandle handle) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	auto result = diskann_detached_serialize(handle, err_buf, ERR_BUF_LEN);
+	if (!result.data) {
+		throw std::runtime_error("DiskANN serialize: " + std::string(err_buf));
 	}
-	return result.GetJson();
+	return {result.data, result.len};
 }
 
-std::string DiskannGetInfo(const std::string &name) {
-	RustResult result(diskann_get_info(name.c_str()));
-	if (result.HasError()) {
-		throw std::runtime_error("DiskANN info failed: " + result.GetError());
+DiskannHandle DiskannDetachedDeserialize(const uint8_t *data, size_t len, float alpha) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	auto handle = diskann_detached_deserialize(data, len, alpha, err_buf, ERR_BUF_LEN);
+	if (!handle) {
+		throw std::runtime_error("DiskANN deserialize: " + std::string(err_buf));
 	}
-	return result.GetJson();
+	return handle;
 }
 
-bool IsDiskannRustAvailable() {
-	return true;
+void DiskannFreeSerializedBytes(DiskannSerializedData bytes) {
+	DiskannBytes raw_bytes;
+	raw_bytes.data = bytes.data;
+	raw_bytes.len = bytes.len;
+	diskann_free_bytes(raw_bytes);
 }
 
-std::string GetDiskannRustVersion() {
-	const char *ver = diskann_rust_version();
-	return ver ? std::string(ver) : "unknown";
+// ========================================
+// Compact / vacuum wrappers
+// ========================================
+
+DiskannCompactResult DiskannDetachedCompact(DiskannHandle handle, const uint32_t *deleted_labels, size_t num_deleted) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	auto result = diskann_detached_compact(handle, deleted_labels, num_deleted, err_buf, ERR_BUF_LEN);
+	if (!result.new_handle) {
+		throw std::runtime_error("DiskANN compact: " + std::string(err_buf));
+	}
+	return {result.new_handle, result.label_map, result.map_len};
+}
+
+void DiskannFreeLabelMap(uint32_t *map, size_t map_len) {
+	diskann_free_label_map(map, map_len);
+}
+
+// ========================================
+// Vector accessor wrapper
+// ========================================
+
+int32_t DiskannDetachedGetVector(DiskannHandle handle, uint32_t label, float *out_vec, int32_t capacity) {
+	return diskann_detached_get_vector(handle, label, out_vec, capacity);
 }
 
 } // namespace duckdb

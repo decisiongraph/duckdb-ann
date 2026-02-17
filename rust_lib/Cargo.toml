@@ -13,18 +13,21 @@ lto = "thin"
 codegen-units = 1
 
 [dependencies]
-# DiskANN -- official Microsoft Rust rewrite
-diskann = { version = "0.45", features = ["testing"] }
+# DiskANN
+diskann = "0.45"
+diskann-vector = "0.45"
 
 # Async runtime (diskann is async-native)
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures-util = { version = "0.3", default-features = false }
 
 # Concurrency
 parking_lot = "0.12"
 dashmap = "6"
 
+# Memory-mapped I/O
+memmap2 = "0.9"
+hashbrown = "0.15"
+
 # Error handling
 anyhow = "1"
-
-# JSON serialization for complex returns
-serde_json = "1"

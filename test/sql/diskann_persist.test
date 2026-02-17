@@ -1,0 +1,87 @@
+# name: test/sql/diskann_persist.test
+# description: Test DiskANN BoundIndex persistence across restart with search
+# group: [diskann]
+
+require annsearch
+
+load __TEST_DIR__/diskann_persist.db
+
+# ========================================
+# Session 1: Create and populate
+# ========================================
+
+statement ok
+CREATE TABLE vectors (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vectors VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]);
+
+statement ok
+CREATE INDEX persist_idx ON vectors USING DISKANN (embedding);
+
+# Search before checkpoint
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('vectors', 'persist_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vectors v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+CHECKPOINT;
+
+# ========================================
+# Session 2: Reopen and verify search works
+# ========================================
+
+restart
+
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('vectors', 'persist_idx', [1.0, 0.0, 0.0], 3) s
+JOIN vectors v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.0
+2	2.0
+3	2.0
+
+# Insert after reopen
+statement ok
+INSERT INTO vectors VALUES (4, [0.5, 0.5, 0.0]);
+
+# Search should include new vector
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('vectors', 'persist_idx', [1.0, 0.0, 0.0], 2) s
+JOIN vectors v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.0
+4	0.5
+
+statement ok
+CHECKPOINT;
+
+# ========================================
+# Session 3: Verify insert persists
+# ========================================
+
+restart
+
+query I
+SELECT count(*) FROM vectors;
+----
+4
+
+query II
+SELECT v.id, s.distance
+FROM diskann_index_scan('vectors', 'persist_idx', [1.0, 0.0, 0.0], 2) s
+JOIN vectors v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.0
+4	0.5

@@ -19,6 +19,9 @@ public:
 	/// Human-readable device info (e.g., "Apple M2 Pro (Metal)")
 	virtual std::string DeviceInfo() const = 0;
 
+	/// Backend name for index tracking (e.g., "metal", "cuda")
+	virtual std::string BackendName() const = 0;
+
 	/// Move a CPU index to GPU. Returns new GPU index. Throws on failure.
 	virtual std::unique_ptr<faiss::Index> CpuToGpu(faiss::Index *cpu_index) = 0;
 
