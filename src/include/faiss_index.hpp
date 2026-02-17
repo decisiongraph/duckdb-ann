@@ -20,6 +20,60 @@ namespace duckdb {
 
 class DuckTableEntry;
 
+// Shared FAISS option parsing — single source of truth
+struct FaissParams {
+	string metric = "L2";
+	string index_type = "Flat";
+	int32_t hnsw_m = 32;
+	int32_t ivf_nlist = 100;
+	int32_t nprobe = 1;
+	int64_t train_sample = 0;
+	string description;
+	bool gpu = false;
+
+	static FaissParams Parse(const case_insensitive_map_t<Value> &options) {
+		FaissParams p;
+		for (auto &kv : options) {
+			if (kv.first == "metric") {
+				p.metric = kv.second.ToString();
+			} else if (kv.first == "type") {
+				p.index_type = kv.second.ToString();
+			} else if (kv.first == "hnsw_m") {
+				p.hnsw_m = kv.second.GetValue<int32_t>();
+			} else if (kv.first == "ivf_nlist") {
+				p.ivf_nlist = kv.second.GetValue<int32_t>();
+			} else if (kv.first == "nprobe") {
+				p.nprobe = MaxValue<int32_t>(1, kv.second.GetValue<int32_t>());
+			} else if (kv.first == "train_sample") {
+				p.train_sample = kv.second.GetValue<int64_t>();
+			} else if (kv.first == "description") {
+				p.description = kv.second.ToString();
+			} else if (kv.first == "gpu") {
+				p.gpu = BooleanValue::Get(kv.second.DefaultCastAs(LogicalType::BOOLEAN));
+			}
+		}
+		if (p.index_type.empty()) {
+			p.index_type = "Flat";
+		}
+		return p;
+	}
+
+	case_insensitive_map_t<Value> ToOptions() const {
+		case_insensitive_map_t<Value> opts;
+		opts["metric"] = Value(metric);
+		opts["type"] = Value(index_type);
+		opts["hnsw_m"] = Value::INTEGER(hnsw_m);
+		opts["ivf_nlist"] = Value::INTEGER(ivf_nlist);
+		if (!description.empty()) {
+			opts["description"] = Value(description);
+		}
+		if (gpu) {
+			opts["gpu"] = Value::BOOLEAN(true);
+		}
+		return opts;
+	}
+};
+
 // ========================================
 // FaissIndex: BoundIndex backed by libfaiss
 // ========================================

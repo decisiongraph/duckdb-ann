@@ -16,6 +16,48 @@ namespace duckdb {
 
 class DuckTableEntry;
 
+// Shared DiskANN option parsing — single source of truth
+struct DiskannParams {
+	string metric = "L2";
+	int32_t max_degree = 64;
+	int32_t build_complexity = 128;
+	float alpha = 1.2f;
+	bool quantize_sq8 = false;
+
+	static DiskannParams Parse(const case_insensitive_map_t<Value> &options) {
+		DiskannParams p;
+		for (auto &kv : options) {
+			if (kv.first == "metric") {
+				p.metric = kv.second.ToString();
+			} else if (kv.first == "max_degree") {
+				p.max_degree = kv.second.GetValue<int32_t>();
+			} else if (kv.first == "build_complexity") {
+				p.build_complexity = kv.second.GetValue<int32_t>();
+			} else if (kv.first == "alpha") {
+				p.alpha = kv.second.GetValue<float>();
+			} else if (kv.first == "quantization") {
+				auto val = kv.second.ToString();
+				if (val == "sq8" || val == "SQ8") {
+					p.quantize_sq8 = true;
+				}
+			}
+		}
+		return p;
+	}
+
+	case_insensitive_map_t<Value> ToOptions() const {
+		case_insensitive_map_t<Value> opts;
+		opts["metric"] = Value(metric);
+		opts["max_degree"] = Value::INTEGER(max_degree);
+		opts["build_complexity"] = Value::INTEGER(build_complexity);
+		opts["alpha"] = Value::FLOAT(alpha);
+		if (quantize_sq8) {
+			opts["quantization"] = Value("sq8");
+		}
+		return opts;
+	}
+};
+
 // ========================================
 // DiskannIndex: BoundIndex implementation
 // ========================================

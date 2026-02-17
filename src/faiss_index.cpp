@@ -73,25 +73,15 @@ FaissIndex::FaissIndex(const string &name, IndexConstraintType constraint_type, 
 	}
 
 	// Parse options
-	for (auto &kv : options) {
-		if (kv.first == "metric") {
-			metric_ = kv.second.ToString();
-		} else if (kv.first == "type") {
-			index_type_ = kv.second.ToString();
-		} else if (kv.first == "hnsw_m") {
-			hnsw_m_ = kv.second.GetValue<int32_t>();
-		} else if (kv.first == "ivf_nlist") {
-			ivf_nlist_ = kv.second.GetValue<int32_t>();
-		} else if (kv.first == "nprobe") {
-			nprobe_ = MaxValue<int32_t>(1, kv.second.GetValue<int32_t>());
-		} else if (kv.first == "train_sample") {
-			train_sample_ = kv.second.GetValue<int64_t>();
-		} else if (kv.first == "description") {
-			description_ = kv.second.ToString();
-		} else if (kv.first == "gpu") {
-			gpu_ = BooleanValue::Get(kv.second.DefaultCastAs(LogicalType::BOOLEAN));
-		}
-	}
+	auto params = FaissParams::Parse(options);
+	metric_ = params.metric;
+	index_type_ = params.index_type;
+	hnsw_m_ = params.hnsw_m;
+	ivf_nlist_ = params.ivf_nlist;
+	nprobe_ = params.nprobe;
+	train_sample_ = params.train_sample;
+	description_ = params.description;
+	gpu_ = params.gpu;
 
 	// Detect dimension
 	if (!unbound_expressions.empty()) {
@@ -202,14 +192,7 @@ public:
 	vector<float> all_vectors;
 	vector<row_t> all_rowids;
 	int32_t dimension = 0;
-	string metric = "L2";
-	string index_type = "Flat";
-	int32_t hnsw_m = 32;
-	int32_t ivf_nlist = 100;
-	int32_t nprobe = 1;
-	int64_t train_sample = 0;
-	string description;
-	bool gpu = false;
+	FaissParams params;
 };
 
 class CreateFaissLocalSinkState : public LocalSinkState {};
@@ -220,29 +203,7 @@ unique_ptr<GlobalSinkState> PhysicalCreateFaissIndex::GetGlobalSinkState(ClientC
 	auto &type = unbound_expressions[0]->return_type;
 	state->dimension = static_cast<int32_t>(ArrayType::GetSize(type));
 
-	for (auto &kv : info->options) {
-		if (kv.first == "metric") {
-			state->metric = kv.second.ToString();
-		} else if (kv.first == "type") {
-			state->index_type = kv.second.ToString();
-		} else if (kv.first == "hnsw_m") {
-			state->hnsw_m = kv.second.GetValue<int32_t>();
-		} else if (kv.first == "ivf_nlist") {
-			state->ivf_nlist = kv.second.GetValue<int32_t>();
-		} else if (kv.first == "nprobe") {
-			state->nprobe = MaxValue<int32_t>(1, kv.second.GetValue<int32_t>());
-		} else if (kv.first == "train_sample") {
-			state->train_sample = kv.second.GetValue<int64_t>();
-		} else if (kv.first == "description") {
-			state->description = kv.second.ToString();
-		} else if (kv.first == "gpu") {
-			state->gpu = BooleanValue::Get(kv.second.DefaultCastAs(LogicalType::BOOLEAN));
-		}
-	}
-
-	if (state->index_type.empty()) {
-		state->index_type = "Flat";
-	}
+	state->params = FaissParams::Parse(info->options);
 
 	// Pre-reserve based on estimated cardinality to avoid realloc+copy cycles
 	if (estimated_cardinality > 0) {
@@ -308,15 +269,15 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 	}
 
 	// Create FAISS index
-	auto faiss_idx = MakeFaissIndex(state.dimension, state.metric, state.index_type, state.description, state.hnsw_m,
-	                                state.ivf_nlist);
+	auto faiss_idx = MakeFaissIndex(state.dimension, state.params.metric, state.params.index_type,
+	                                state.params.description, state.params.hnsw_m, state.params.ivf_nlist);
 
 	// Train if needed (IVF indexes)
 	idx_t n_vectors = state.all_rowids.size();
 	if (n_vectors > 0 && !faiss_idx->is_trained) {
-		if (state.train_sample > 0 && state.train_sample < static_cast<int64_t>(n_vectors)) {
+		if (state.params.train_sample > 0 && state.params.train_sample < static_cast<int64_t>(n_vectors)) {
 			// Use a subset of vectors for training
-			auto sample_n = static_cast<idx_t>(state.train_sample);
+			auto sample_n = static_cast<idx_t>(state.params.train_sample);
 			vector<float> sample(sample_n * state.dimension);
 			// Deterministic stride-based sampling
 			double stride = static_cast<double>(n_vectors) / sample_n;
@@ -332,10 +293,10 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 	}
 
 	// Set nprobe for IVF indexes
-	if (state.nprobe > 1) {
+	if (state.params.nprobe > 1) {
 		auto *ivf = dynamic_cast<faiss::IndexIVFFlat *>(faiss_idx.get());
 		if (ivf) {
-			ivf->nprobe = static_cast<size_t>(state.nprobe);
+			ivf->nprobe = static_cast<size_t>(state.params.nprobe);
 		}
 	}
 
@@ -347,23 +308,13 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 	// Build row ID mapping
 	vector<row_t> label_to_rowid(n_vectors);
 	unordered_map<row_t, int64_t> rowid_to_label;
+	rowid_to_label.reserve(n_vectors);
 	for (idx_t i = 0; i < n_vectors; i++) {
 		label_to_rowid[i] = state.all_rowids[i];
 		rowid_to_label[state.all_rowids[i]] = static_cast<int64_t>(i);
 	}
 
-	// Build options map
-	case_insensitive_map_t<Value> options;
-	options["metric"] = Value(state.metric);
-	options["type"] = Value(state.index_type);
-	options["hnsw_m"] = Value::INTEGER(state.hnsw_m);
-	options["ivf_nlist"] = Value::INTEGER(state.ivf_nlist);
-	if (!state.description.empty()) {
-		options["description"] = Value(state.description);
-	}
-	if (state.gpu) {
-		options["gpu"] = Value::BOOLEAN(true);
-	}
+	auto options = state.params.ToOptions();
 
 	auto index = make_uniq<FaissIndex>(info->index_name, info->constraint_type, storage_ids,
 	                                   TableIOManager::Get(storage), unbound_expressions, storage.db, options);
@@ -371,14 +322,14 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 	// Transfer built state
 	index->faiss_index_ = std::move(faiss_idx);
 	index->dimension_ = state.dimension;
-	index->metric_ = state.metric;
-	index->index_type_ = state.index_type;
-	index->hnsw_m_ = state.hnsw_m;
-	index->ivf_nlist_ = state.ivf_nlist;
-	index->nprobe_ = state.nprobe;
-	index->train_sample_ = state.train_sample;
-	index->description_ = state.description;
-	index->gpu_ = state.gpu;
+	index->metric_ = state.params.metric;
+	index->index_type_ = state.params.index_type;
+	index->hnsw_m_ = state.params.hnsw_m;
+	index->ivf_nlist_ = state.params.ivf_nlist;
+	index->nprobe_ = state.params.nprobe;
+	index->train_sample_ = state.params.train_sample;
+	index->description_ = state.params.description;
+	index->gpu_ = state.params.gpu;
 	index->label_to_rowid_ = std::move(label_to_rowid);
 	index->rowid_to_label_ = std::move(rowid_to_label);
 	index->is_dirty_ = true;
@@ -661,6 +612,7 @@ void FaissIndex::LoadFromStorage(const IndexStorageInfo &info) {
 	gpu_ = (gpu_byte != 0);
 
 	// Rebuild rowid_to_label_ from label_to_rowid_
+	rowid_to_label_.reserve(num_mappings);
 	for (size_t i = 0; i < label_to_rowid_.size(); i++) {
 		if (deleted_labels_.count(static_cast<int64_t>(i)) == 0) {
 			rowid_to_label_[label_to_rowid_[i]] = static_cast<int64_t>(i);
@@ -730,8 +682,7 @@ vector<pair<row_t, float>> FaissIndex::Search(const float *query, int32_t dimens
 		}
 	}
 
-	// Use GPU index for search if available
-	EnsureGpuIndex();
+	// Use GPU index if available (rebuilt after Finalize/LoadFromStorage/Vacuum, not per-query)
 	auto *search_index = gpu_index_ ? gpu_index_.get() : faiss_index_.get();
 
 	// Thread-local scratch buffers — allocated once per thread, reused across queries

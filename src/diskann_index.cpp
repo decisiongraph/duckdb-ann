@@ -29,22 +29,12 @@ DiskannIndex::DiskannIndex(const string &name, IndexConstraintType constraint_ty
 	}
 
 	// Parse options
-	for (auto &kv : options) {
-		if (kv.first == "metric") {
-			metric_ = kv.second.ToString();
-		} else if (kv.first == "max_degree") {
-			max_degree_ = kv.second.GetValue<int32_t>();
-		} else if (kv.first == "build_complexity") {
-			build_complexity_ = kv.second.GetValue<int32_t>();
-		} else if (kv.first == "alpha") {
-			alpha_ = kv.second.GetValue<float>();
-		} else if (kv.first == "quantization") {
-			auto val = kv.second.ToString();
-			if (val == "sq8" || val == "SQ8") {
-				quantize_sq8_ = true;
-			}
-		}
-	}
+	auto params = DiskannParams::Parse(options);
+	metric_ = params.metric;
+	max_degree_ = params.max_degree;
+	build_complexity_ = params.build_complexity;
+	alpha_ = params.alpha;
+	quantize_sq8_ = params.quantize_sq8;
 
 	// Detect dimension from the expression type
 	if (!unbound_expressions.empty()) {
@@ -136,21 +126,10 @@ PhysicalCreateDiskannIndex::PhysicalCreateDiskannIndex(PhysicalPlan &physical_pl
 // Sink state
 class CreateDiskannGlobalSinkState : public GlobalSinkState {
 public:
-	DiskannHandle rust_handle = nullptr;
-	vector<row_t> label_to_rowid;
-	unordered_map<row_t, uint32_t> rowid_to_label;
+	vector<float> all_vectors;
+	vector<row_t> all_rowids;
 	int32_t dimension = 0;
-	string metric = "L2";
-	int32_t max_degree = 64;
-	int32_t build_complexity = 128;
-	float alpha = 1.2f;
-	bool quantize_sq8 = false;
-
-	~CreateDiskannGlobalSinkState() override {
-		if (rust_handle) {
-			DiskannFreeDetached(rust_handle);
-		}
-	}
+	DiskannParams params;
 };
 
 class CreateDiskannLocalSinkState : public LocalSinkState {};
@@ -162,26 +141,14 @@ unique_ptr<GlobalSinkState> PhysicalCreateDiskannIndex::GetGlobalSinkState(Clien
 	auto &type = unbound_expressions[0]->return_type;
 	state->dimension = static_cast<int32_t>(ArrayType::GetSize(type));
 
-	// Parse options
-	for (auto &kv : info->options) {
-		if (kv.first == "metric") {
-			state->metric = kv.second.ToString();
-		} else if (kv.first == "max_degree") {
-			state->max_degree = kv.second.GetValue<int32_t>();
-		} else if (kv.first == "build_complexity") {
-			state->build_complexity = kv.second.GetValue<int32_t>();
-		} else if (kv.first == "alpha") {
-			state->alpha = kv.second.GetValue<float>();
-		} else if (kv.first == "quantization") {
-			auto val = kv.second.ToString();
-			if (val == "sq8" || val == "SQ8") {
-				state->quantize_sq8 = true;
-			}
-		}
+	state->params = DiskannParams::Parse(info->options);
+
+	// Pre-reserve based on estimated cardinality to avoid realloc+copy cycles
+	if (estimated_cardinality > 0) {
+		state->all_vectors.reserve(estimated_cardinality * state->dimension);
+		state->all_rowids.reserve(estimated_cardinality);
 	}
 
-	state->rust_handle = DiskannCreateDetached(state->dimension, state->metric, state->max_degree,
-	                                           state->build_complexity, state->alpha);
 	return std::move(state);
 }
 
@@ -220,11 +187,8 @@ SinkResultType PhysicalCreateDiskannIndex::Sink(ExecutionContext &context, DataC
 		auto row_id = rowid_data[row_idx];
 		const float *vec_ptr = child_data + i * array_size;
 
-		auto label = DiskannDetachedAdd(state.rust_handle, vec_ptr, state.dimension);
-		auto label_u32 = static_cast<uint32_t>(label);
-
-		state.label_to_rowid.push_back(row_id);
-		state.rowid_to_label[row_id] = label_u32;
+		state.all_vectors.insert(state.all_vectors.end(), vec_ptr, vec_ptr + array_size);
+		state.all_rowids.push_back(row_id);
 	}
 
 	return SinkResultType::NEED_MORE_INPUT;
@@ -245,33 +209,41 @@ SinkFinalizeType PhysicalCreateDiskannIndex::Finalize(Pipeline &pipeline, Event 
 		    "Transaction conflict: cannot add an index to a table that has been altered or dropped");
 	}
 
-	// Build options map
-	case_insensitive_map_t<Value> options;
-	options["metric"] = Value(state.metric);
-	options["max_degree"] = Value::INTEGER(state.max_degree);
-	options["build_complexity"] = Value::INTEGER(state.build_complexity);
-	options["alpha"] = Value::FLOAT(state.alpha);
-	if (state.quantize_sq8) {
-		options["quantization"] = Value("sq8");
-	}
+	auto options = state.params.ToOptions();
 
 	auto index = make_uniq<DiskannIndex>(info->index_name, info->constraint_type, storage_ids,
 	                                     TableIOManager::Get(storage), unbound_expressions, storage.db, options);
 
-	// Transfer the built Rust index
-	index->rust_handle_ = state.rust_handle;
-	state.rust_handle = nullptr;
+	// Create Rust index and add all vectors
+	auto rust_handle = DiskannCreateDetached(state.dimension, state.params.metric, state.params.max_degree,
+	                                         state.params.build_complexity, state.params.alpha);
+
+	idx_t n_vectors = state.all_rowids.size();
+	vector<row_t> label_to_rowid(n_vectors);
+	unordered_map<row_t, uint32_t> rowid_to_label;
+	rowid_to_label.reserve(n_vectors);
+
+	for (idx_t i = 0; i < n_vectors; i++) {
+		const float *vec_ptr = state.all_vectors.data() + i * state.dimension;
+		auto label = DiskannDetachedAdd(rust_handle, vec_ptr, state.dimension);
+		auto label_u32 = static_cast<uint32_t>(label);
+		label_to_rowid[i] = state.all_rowids[i];
+		rowid_to_label[state.all_rowids[i]] = label_u32;
+	}
+
+	// Transfer built state
+	index->rust_handle_ = rust_handle;
 	index->dimension_ = state.dimension;
-	index->metric_ = state.metric;
-	index->max_degree_ = state.max_degree;
-	index->build_complexity_ = state.build_complexity;
-	index->alpha_ = state.alpha;
-	index->label_to_rowid_ = std::move(state.label_to_rowid);
-	index->rowid_to_label_ = std::move(state.rowid_to_label);
+	index->metric_ = state.params.metric;
+	index->max_degree_ = state.params.max_degree;
+	index->build_complexity_ = state.params.build_complexity;
+	index->alpha_ = state.params.alpha;
+	index->label_to_rowid_ = std::move(label_to_rowid);
+	index->rowid_to_label_ = std::move(rowid_to_label);
 	index->is_dirty_ = true;
 
 	// Apply SQ8 quantization if requested
-	if (state.quantize_sq8 && index->rust_handle_) {
+	if (state.params.quantize_sq8 && rust_handle) {
 		DiskannDetachedQuantizeSQ8(index->rust_handle_);
 		index->quantize_sq8_ = true;
 	}
@@ -517,6 +489,7 @@ void DiskannIndex::LoadFromStorage(const IndexStorageInfo &info) {
 	reader.Read(reinterpret_cast<uint8_t *>(&alpha_bits), sizeof(uint32_t));
 	memcpy(&alpha_, &alpha_bits, sizeof(float));
 
+	rowid_to_label_.reserve(num_mappings);
 	for (size_t i = 0; i < label_to_rowid_.size(); i++) {
 		if (deleted_labels_.count(static_cast<uint32_t>(i)) == 0) {
 			rowid_to_label_[label_to_rowid_[i]] = static_cast<uint32_t>(i);
