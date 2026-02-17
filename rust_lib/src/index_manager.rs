@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::io::{BufWriter, Cursor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -141,6 +142,37 @@ impl Metric {
     }
 }
 
+/// Reusable search scratch space to reduce per-search allocations.
+/// Buffers grow as needed but are never shrunk.
+struct SearchContext {
+    ids: Vec<u32>,
+    distances: Vec<f32>,
+}
+
+impl SearchContext {
+    fn new() -> Self {
+        Self {
+            ids: Vec::new(),
+            distances: Vec::new(),
+        }
+    }
+
+    fn ensure_capacity(&mut self, k: usize) {
+        if self.ids.len() < k {
+            self.ids.resize(k, 0);
+            self.distances.resize(k, 0.0);
+        }
+    }
+
+    fn split_slices(&mut self, k: usize) -> (&mut [u32], &mut [f32]) {
+        (&mut self.ids[..k], &mut self.distances[..k])
+    }
+}
+
+thread_local! {
+    static SEARCH_CTX: RefCell<SearchContext> = RefCell::new(SearchContext::new());
+}
+
 impl InMemoryIndex {
     /// Create a detached (unregistered) index for streaming build.
     pub fn new_detached(
@@ -269,22 +301,34 @@ impl InMemoryIndex {
         let params = SearchParams::new(k, l_search, None)
             .map_err(|e| anyhow!("SearchParams error: {}", e))?;
 
-        let mut ids = vec![0u32; k];
-        let mut distances = vec![0.0f32; k];
-        let mut buffer = IdDistance::new(&mut ids, &mut distances);
+        // Use thread-local scratch buffers to avoid per-search allocations
+        SEARCH_CTX.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.ensure_capacity(k);
 
-        let stats =
-            runtime::block_on(index.search(&strategy, &ctx, query, &params, &mut buffer))
-                .map_err(|e| anyhow!("DiskANN search error: {}", e))?;
+            // Zero out reused buffers
+            scratch.ids[..k].fill(0);
+            scratch.distances[..k].fill(0.0);
 
-        let result_count = stats.result_count as usize;
-        let results: Vec<(u64, f32)> = ids[..result_count]
-            .iter()
-            .zip(distances[..result_count].iter())
-            .map(|(id, dist)| (*id as u64, *dist))
-            .collect();
+            let result_count = {
+                let (id_slice, dist_slice) = scratch.split_slices(k);
+                let mut buffer = IdDistance::new(id_slice, dist_slice);
 
-        Ok(results)
+                let stats =
+                    runtime::block_on(index.search(&strategy, &ctx, query, &params, &mut buffer))
+                        .map_err(|e| anyhow!("DiskANN search error: {}", e))?;
+
+                stats.result_count as usize
+            };
+
+            let results: Vec<(u64, f32)> = scratch.ids[..result_count]
+                .iter()
+                .zip(scratch.distances[..result_count].iter())
+                .map(|(id, dist)| (*id as u64, *dist))
+                .collect();
+
+            Ok(results)
+        })
     }
 
     /// Get adjacency lists for all vectors 0..count, each padded/truncated to max_deg.

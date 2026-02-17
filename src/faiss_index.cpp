@@ -169,6 +169,10 @@ FaissIndex::FaissIndex(const string &name, IndexConstraintType constraint_type, 
 			hnsw_m_ = kv.second.GetValue<int32_t>();
 		} else if (kv.first == "ivf_nlist") {
 			ivf_nlist_ = kv.second.GetValue<int32_t>();
+		} else if (kv.first == "nprobe") {
+			nprobe_ = MaxValue<int32_t>(1, kv.second.GetValue<int32_t>());
+		} else if (kv.first == "train_sample") {
+			train_sample_ = kv.second.GetValue<int64_t>();
 		} else if (kv.first == "description") {
 			description_ = kv.second.ToString();
 		}
@@ -265,6 +269,8 @@ public:
 	string index_type = "Flat";
 	int32_t hnsw_m = 32;
 	int32_t ivf_nlist = 100;
+	int32_t nprobe = 1;
+	int64_t train_sample = 0;
 	string description;
 };
 
@@ -285,6 +291,10 @@ unique_ptr<GlobalSinkState> PhysicalCreateFaissIndex::GetGlobalSinkState(ClientC
 			state->hnsw_m = kv.second.GetValue<int32_t>();
 		} else if (kv.first == "ivf_nlist") {
 			state->ivf_nlist = kv.second.GetValue<int32_t>();
+		} else if (kv.first == "nprobe") {
+			state->nprobe = MaxValue<int32_t>(1, kv.second.GetValue<int32_t>());
+		} else if (kv.first == "train_sample") {
+			state->train_sample = kv.second.GetValue<int64_t>();
 		} else if (kv.first == "description") {
 			state->description = kv.second.ToString();
 		}
@@ -358,7 +368,29 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 	// Train if needed (IVF indexes)
 	idx_t n_vectors = state.all_rowids.size();
 	if (n_vectors > 0 && !faiss_idx->is_trained) {
-		faiss_idx->train(static_cast<faiss::idx_t>(n_vectors), state.all_vectors.data());
+		if (state.train_sample > 0 && state.train_sample < static_cast<int64_t>(n_vectors)) {
+			// Use a subset of vectors for training
+			auto sample_n = static_cast<idx_t>(state.train_sample);
+			vector<float> sample(sample_n * state.dimension);
+			// Deterministic stride-based sampling
+			double stride = static_cast<double>(n_vectors) / sample_n;
+			for (idx_t i = 0; i < sample_n; i++) {
+				auto src_idx = static_cast<idx_t>(i * stride);
+				memcpy(sample.data() + i * state.dimension, state.all_vectors.data() + src_idx * state.dimension,
+				       state.dimension * sizeof(float));
+			}
+			faiss_idx->train(static_cast<faiss::idx_t>(sample_n), sample.data());
+		} else {
+			faiss_idx->train(static_cast<faiss::idx_t>(n_vectors), state.all_vectors.data());
+		}
+	}
+
+	// Set nprobe for IVF indexes
+	if (state.nprobe > 1) {
+		auto *ivf = dynamic_cast<faiss::IndexIVFFlat *>(faiss_idx.get());
+		if (ivf) {
+			ivf->nprobe = static_cast<size_t>(state.nprobe);
+		}
 	}
 
 	// Add all vectors
@@ -394,6 +426,8 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 	index->index_type_ = state.index_type;
 	index->hnsw_m_ = state.hnsw_m;
 	index->ivf_nlist_ = state.ivf_nlist;
+	index->nprobe_ = state.nprobe;
+	index->train_sample_ = state.train_sample;
 	index->description_ = state.description;
 	index->label_to_rowid_ = std::move(label_to_rowid);
 	index->rowid_to_label_ = std::move(rowid_to_label);
@@ -579,6 +613,8 @@ void FaissIndex::PersistToDisk() {
 	writer.Write(reinterpret_cast<const uint8_t *>(index_type_.data()), type_len);
 	writer.Write(reinterpret_cast<const uint8_t *>(&hnsw_m_), sizeof(int32_t));
 	writer.Write(reinterpret_cast<const uint8_t *>(&ivf_nlist_), sizeof(int32_t));
+	writer.Write(reinterpret_cast<const uint8_t *>(&nprobe_), sizeof(int32_t));
+	writer.Write(reinterpret_cast<const uint8_t *>(&train_sample_), sizeof(int64_t));
 	uint32_t desc_len = static_cast<uint32_t>(description_.size());
 	writer.Write(reinterpret_cast<const uint8_t *>(&desc_len), sizeof(uint32_t));
 	if (desc_len > 0) {
@@ -638,6 +674,8 @@ void FaissIndex::LoadFromStorage(const IndexStorageInfo &info) {
 
 	reader.Read(reinterpret_cast<uint8_t *>(&hnsw_m_), sizeof(int32_t));
 	reader.Read(reinterpret_cast<uint8_t *>(&ivf_nlist_), sizeof(int32_t));
+	reader.Read(reinterpret_cast<uint8_t *>(&nprobe_), sizeof(int32_t));
+	reader.Read(reinterpret_cast<uint8_t *>(&train_sample_), sizeof(int64_t));
 
 	uint32_t desc_len = 0;
 	reader.Read(reinterpret_cast<uint8_t *>(&desc_len), sizeof(uint32_t));
@@ -704,6 +742,14 @@ vector<pair<row_t, float>> FaissIndex::Search(const float *query, int32_t dimens
 	request_k = MinValue<int32_t>(request_k, static_cast<int32_t>(faiss_index_->ntotal));
 	if (request_k <= 0) {
 		return {};
+	}
+
+	// Set nprobe for IVF indexes before searching
+	if (nprobe_ > 1) {
+		auto *ivf = dynamic_cast<faiss::IndexIVFFlat *>(faiss_index_.get());
+		if (ivf) {
+			ivf->nprobe = static_cast<size_t>(nprobe_);
+		}
 	}
 
 	vector<faiss::idx_t> labels(request_k);

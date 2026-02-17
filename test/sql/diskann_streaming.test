@@ -1,0 +1,147 @@
+# name: test/sql/diskann_streaming.test
+# description: DiskANN streaming build recall test - verifies ANN recall quality
+# group: [diskann]
+
+require annsearch
+
+# ========================================
+# Generate deterministic random vectors
+# ========================================
+
+statement ok
+SELECT setseed(0.42);
+
+statement ok
+CREATE TABLE vecs AS
+SELECT i AS id,
+  [random()::FLOAT, random()::FLOAT, random()::FLOAT, random()::FLOAT]::FLOAT[4] AS embedding
+FROM range(0, 200) t(i);
+
+# Ground truth copy (no index, for brute-force comparison)
+statement ok
+CREATE TABLE gt_vecs AS SELECT * FROM vecs;
+
+# Create DISKANN index on the main table
+statement ok
+CREATE INDEX vecs_idx ON vecs USING DISKANN (embedding);
+
+# ========================================
+# Recall test: query 1 (near origin)
+# ========================================
+
+# Brute-force top-10 nearest to [0.5, 0.5, 0.5, 0.5]
+statement ok
+CREATE TABLE gt1 AS
+SELECT id FROM gt_vecs
+ORDER BY array_distance(embedding, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
+LIMIT 10;
+
+# ANN top-10 using ann_search
+statement ok
+CREATE TABLE ann1 AS
+SELECT id FROM ann_search('vecs', 'vecs_idx', [0.5, 0.5, 0.5, 0.5], 10);
+
+# Recall: count overlap between brute-force and ANN results
+# Expect at least 7 of 10 (70% recall minimum for small dataset)
+query I
+SELECT (SELECT count(*) FROM gt1 g JOIN ann1 a ON g.id = a.id) >= 7;
+----
+true
+
+statement ok
+DROP TABLE gt1;
+
+statement ok
+DROP TABLE ann1;
+
+# ========================================
+# Recall test: query 2 (near [1,0,0,0])
+# ========================================
+
+statement ok
+CREATE TABLE gt2 AS
+SELECT id FROM gt_vecs
+ORDER BY array_distance(embedding, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 10;
+
+statement ok
+CREATE TABLE ann2 AS
+SELECT id FROM ann_search('vecs', 'vecs_idx', [1.0, 0.0, 0.0, 0.0], 10);
+
+query I
+SELECT (SELECT count(*) FROM gt2 g JOIN ann2 a ON g.id = a.id) >= 7;
+----
+true
+
+statement ok
+DROP TABLE gt2;
+
+statement ok
+DROP TABLE ann2;
+
+# ========================================
+# Recall test: query 3 (near [0,0,1,1])
+# ========================================
+
+statement ok
+CREATE TABLE gt3 AS
+SELECT id FROM gt_vecs
+ORDER BY array_distance(embedding, [0.0, 0.0, 1.0, 1.0]::FLOAT[4])
+LIMIT 10;
+
+statement ok
+CREATE TABLE ann3 AS
+SELECT id FROM ann_search('vecs', 'vecs_idx', [0.0, 0.0, 1.0, 1.0], 10);
+
+query I
+SELECT (SELECT count(*) FROM gt3 g JOIN ann3 a ON g.id = a.id) >= 7;
+----
+true
+
+statement ok
+DROP TABLE gt3;
+
+statement ok
+DROP TABLE ann3;
+
+# ========================================
+# Recall test using optimizer path
+# ORDER BY array_distance() LIMIT k
+# ========================================
+
+# The optimizer should rewrite this to use ANN index scan
+# but we compare against the brute-force gt_vecs
+
+statement ok
+CREATE TABLE gt4 AS
+SELECT id FROM gt_vecs
+ORDER BY array_distance(embedding, [0.2, 0.8, 0.3, 0.7]::FLOAT[4])
+LIMIT 10;
+
+statement ok
+CREATE TABLE opt4 AS
+SELECT id
+FROM vecs
+ORDER BY array_distance(embedding, [0.2, 0.8, 0.3, 0.7]::FLOAT[4])
+LIMIT 10;
+
+query I
+SELECT (SELECT count(*) FROM gt4 g JOIN opt4 a ON g.id = a.id) >= 7;
+----
+true
+
+# Clean up
+statement ok
+DROP TABLE gt4;
+
+statement ok
+DROP TABLE opt4;
+
+statement ok
+DROP INDEX vecs_idx;
+
+statement ok
+DROP TABLE vecs;
+
+statement ok
+DROP TABLE gt_vecs;

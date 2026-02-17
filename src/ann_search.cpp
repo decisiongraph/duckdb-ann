@@ -25,6 +25,7 @@ struct AnnSearchBindData : public TableFunctionData {
 	vector<float> query;
 	int32_t k;
 	int32_t search_complexity = 0;
+	int32_t oversample = 1;
 
 	// Resolved at bind time
 	vector<string> column_names;
@@ -57,6 +58,8 @@ static unique_ptr<FunctionData> AnnSearchBind(ClientContext &context, TableFunct
 	for (auto &kv : input.named_parameters) {
 		if (kv.first == "search_complexity") {
 			bind_data->search_complexity = kv.second.GetValue<int32_t>();
+		} else if (kv.first == "oversample") {
+			bind_data->oversample = MaxValue<int32_t>(1, kv.second.GetValue<int32_t>());
 		}
 	}
 
@@ -101,6 +104,8 @@ static void AnnSearchScan(ClientContext &context, TableFunctionInput &data, Data
 		auto &storage = duck_table.GetStorage();
 		auto &indexes = storage.GetDataTableInfo()->GetIndexes();
 
+		auto fetch_k = bind.k * bind.oversample;
+
 		bool found = false;
 		indexes.Scan([&](Index &idx) {
 			if (idx.GetIndexName() != bind.index_name) {
@@ -110,7 +115,7 @@ static void AnnSearchScan(ClientContext &context, TableFunctionInput &data, Data
 
 			auto *diskann = dynamic_cast<DiskannIndex *>(&bound);
 			if (diskann) {
-				state.results = diskann->Search(bind.query.data(), static_cast<int32_t>(bind.query.size()), bind.k,
+				state.results = diskann->Search(bind.query.data(), static_cast<int32_t>(bind.query.size()), fetch_k,
 				                                bind.search_complexity);
 				found = true;
 				return true;
@@ -119,7 +124,7 @@ static void AnnSearchScan(ClientContext &context, TableFunctionInput &data, Data
 #ifdef FAISS_AVAILABLE
 			auto *faiss = dynamic_cast<FaissIndex *>(&bound);
 			if (faiss) {
-				state.results = faiss->Search(bind.query.data(), static_cast<int32_t>(bind.query.size()), bind.k);
+				state.results = faiss->Search(bind.query.data(), static_cast<int32_t>(bind.query.size()), fetch_k);
 				found = true;
 				return true;
 			}
@@ -185,6 +190,7 @@ void RegisterAnnSearchFunction(ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::FLOAT), LogicalType::INTEGER},
 	    AnnSearchScan, AnnSearchBind, AnnSearchInit);
 	func.named_parameters["search_complexity"] = LogicalType::INTEGER;
+	func.named_parameters["oversample"] = LogicalType::INTEGER;
 	loader.RegisterFunction(func);
 }
 

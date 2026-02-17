@@ -152,6 +152,22 @@ static LogicalGet *FindSeqScan(LogicalOperator &op, idx_t target_table_index) {
 	return nullptr;
 }
 
+// Check if a FILTER exists between the projection and the seq_scan
+static bool HasFilterBetween(LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		return true;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		return false;
+	}
+	for (auto &child : op.children) {
+		if (HasFilterBetween(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // Extract query vector from a constant expression (ARRAY or LIST of FLOAT)
 static bool ExtractQueryVector(const BoundConstantExpression &const_expr, vector<float> &out) {
 	auto &val = const_expr.value;
@@ -320,6 +336,11 @@ static bool TryOptimizeOrderBy(ClientContext &context, unique_ptr<LogicalOperato
 
 	// Set limit: use the provided limit_val, or default to a reasonable number
 	idx_t k = (limit_val > 0) ? limit_val : 100;
+
+	// If there's a FILTER in the plan, overfetch to compensate for filtered-out rows
+	if (HasFilterBetween(projection)) {
+		k = MaxValue<idx_t>(k * 3, k + 100);
+	}
 
 	// Build the replacement bind data
 	auto bind_data = make_uniq<AnnIndexScanBindData>();

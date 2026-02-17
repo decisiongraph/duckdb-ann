@@ -82,6 +82,8 @@ private:
 	string index_type_ = "Flat";
 	int32_t hnsw_m_ = 32;
 	int32_t ivf_nlist_ = 100;
+	int32_t nprobe_ = 1;
+	int64_t train_sample_ = 0; // 0 = use all vectors for training
 	string description_;
 
 	// Row ID mapping: internal label (0,1,2,...) <-> DuckDB row_t
