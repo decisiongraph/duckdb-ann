@@ -86,4 +86,19 @@ DiskannStreamingBuildResult DiskannStreamingBuild(const std::string &input_path,
 void DiskannDetachedQuantizeSQ8(DiskannHandle handle);
 bool DiskannDetachedIsQuantized(DiskannHandle handle);
 
+// ========================================
+// Batch search (multi-query, GPU-accelerated for DiskIndex)
+// ========================================
+
+struct DiskannBatchSearchResult {
+	std::vector<int64_t> labels;  // nq * k (row-major, -1 for unfilled)
+	std::vector<float> distances; // nq * k (row-major, MAX for unfilled)
+	std::vector<int32_t> counts;  // nq — actual result count per query
+};
+
+// Multi-query batch search via global registry index.
+// Uses GPU-accelerated lock-step search for DiskIndex, sequential for InMemoryIndex.
+DiskannBatchSearchResult DiskannBatchSearch(const std::string &name, const float *query_matrix, int32_t nq,
+                                            int32_t dimension, int32_t k, int32_t search_complexity);
+
 } // namespace duckdb

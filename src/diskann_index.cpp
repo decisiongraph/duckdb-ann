@@ -577,6 +577,23 @@ vector<pair<row_t, float>> DiskannIndex::Search(const float *query, int32_t dime
 	return results;
 }
 
+vector<vector<pair<row_t, float>>> DiskannIndex::SearchBatch(const vector<vector<float>> &queries, int32_t k,
+                                                             int32_t search_complexity) {
+	auto nq = static_cast<int32_t>(queries.size());
+	vector<vector<pair<row_t, float>>> all_results(nq);
+
+	if (!rust_handle_ || nq == 0) {
+		return all_results;
+	}
+
+	// Sequential per-query search (InMemoryIndex doesn't have GPU batch path)
+	for (int32_t qi = 0; qi < nq; qi++) {
+		all_results[qi] = Search(queries[qi].data(), static_cast<int32_t>(queries[qi].size()), k, search_complexity);
+	}
+
+	return all_results;
+}
+
 // ========================================
 // Utility methods
 // ========================================

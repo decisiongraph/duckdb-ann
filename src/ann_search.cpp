@@ -1,4 +1,5 @@
 #include "diskann_index.hpp"
+#include "rust_ffi.hpp"
 #include "annsearch_extension.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -291,31 +292,41 @@ static void AnnSearchBatchScan(ClientContext &context, TableFunctionInput &data,
 #endif
 
 		auto idx_ptr = indexes.Find(bind.index_name);
+		bool found = false;
 
-		for (int32_t qi = 0; qi < static_cast<int32_t>(bind.queries.size()); qi++) {
-			auto &query = bind.queries[qi];
-			vector<pair<row_t, float>> results;
-
-			if (idx_ptr) {
-				auto *diskann = dynamic_cast<DiskannIndex *>(idx_ptr.get());
-				if (diskann) {
-					results = diskann->Search(query.data(), static_cast<int32_t>(query.size()), bind.k,
-					                          bind.search_complexity);
-				}
-
-#ifdef FAISS_AVAILABLE
-				if (results.empty()) {
-					auto *faiss = dynamic_cast<FaissIndex *>(idx_ptr.get());
-					if (faiss) {
-						results = faiss->Search(query.data(), static_cast<int32_t>(query.size()), bind.k);
+		// Try DiskannIndex batch search
+		if (idx_ptr) {
+			auto *diskann = dynamic_cast<DiskannIndex *>(idx_ptr.get());
+			if (diskann) {
+				auto batch_results = diskann->SearchBatch(bind.queries, bind.k, bind.search_complexity);
+				for (int32_t qi = 0; qi < static_cast<int32_t>(batch_results.size()); qi++) {
+					for (auto &pair : batch_results[qi]) {
+						state.results.push_back({qi, pair.first, pair.second});
 					}
 				}
-#endif
+				found = true;
 			}
+		}
 
-			for (auto &pair : results) {
-				state.results.push_back({qi, pair.first, pair.second});
+#ifdef FAISS_AVAILABLE
+		// FAISS fallback: per-query
+		if (!found && idx_ptr) {
+			auto *faiss = dynamic_cast<FaissIndex *>(idx_ptr.get());
+			if (faiss) {
+				for (int32_t qi = 0; qi < static_cast<int32_t>(bind.queries.size()); qi++) {
+					auto &query = bind.queries[qi];
+					auto results = faiss->Search(query.data(), static_cast<int32_t>(query.size()), bind.k);
+					for (auto &pair : results) {
+						state.results.push_back({qi, pair.first, pair.second});
+					}
+				}
+				found = true;
 			}
+		}
+#endif
+
+		if (!found) {
+			throw InvalidInputException("ANN index '%s' not found on table '%s'", bind.index_name, bind.table_name);
 		}
 	}
 

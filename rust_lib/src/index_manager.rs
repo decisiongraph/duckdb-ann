@@ -131,6 +131,26 @@ impl ManagedIndex {
             ManagedIndex::Disk(idx) => idx.search(query, k, search_complexity),
         }
     }
+
+    /// Batch search: multiple queries. DiskIndex uses lock-step GPU batching;
+    /// InMemoryIndex falls back to sequential per-query search.
+    pub fn search_batch(
+        &self,
+        queries: &[&[f32]],
+        k: usize,
+        search_complexity: u32,
+    ) -> Result<Vec<Vec<(u64, f32)>>> {
+        match self {
+            ManagedIndex::InMemory(idx) => {
+                // Sequential fallback for in-memory indexes
+                queries
+                    .iter()
+                    .map(|q| idx.search(q, k, search_complexity))
+                    .collect()
+            }
+            ManagedIndex::Disk(idx) => idx.search_batch(queries, k, search_complexity),
+        }
+    }
 }
 
 /// In-memory vector store backed by DiskANN graph-based ANN search.
@@ -720,6 +740,38 @@ impl DiskIndex {
         let l_search = k.max(base_l);
 
         Ok(self.provider.search(query, k, l_search))
+    }
+
+    pub fn search_batch(
+        &self,
+        queries: &[&[f32]],
+        k: usize,
+        search_complexity: u32,
+    ) -> Result<Vec<Vec<(u64, f32)>>> {
+        let dim = self.provider.dimension();
+        for (i, q) in queries.iter().enumerate() {
+            if q.len() != dim {
+                return Err(anyhow!(
+                    "Query {} dimension {} doesn't match index dimension {}",
+                    i,
+                    q.len(),
+                    dim
+                ));
+            }
+        }
+
+        let base_l = if search_complexity > 0 {
+            search_complexity as usize
+        } else {
+            self.build_complexity as usize
+        };
+        let l_search = k.max(base_l);
+
+        Ok(self.provider.search_batch(queries, k, l_search))
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.provider.dimension()
     }
 }
 

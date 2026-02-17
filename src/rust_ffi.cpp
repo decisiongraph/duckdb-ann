@@ -58,6 +58,11 @@ int32_t diskann_detached_get_vector(void *handle, uint32_t label, float *out_vec
 // SQ8 Quantization
 int32_t diskann_detached_quantize_sq8(void *handle);
 int32_t diskann_detached_is_quantized(void *handle);
+
+// Batch search (multi-query)
+int32_t diskann_batch_search_buf(const char *name, const float *query_matrix, int32_t nq, int32_t dimension, int32_t k,
+                                 int32_t search_complexity, int64_t *out_labels, float *out_distances,
+                                 int32_t *out_counts, char *err_buf, int32_t err_buf_len);
 }
 
 namespace duckdb {
@@ -187,6 +192,27 @@ void DiskannDetachedQuantizeSQ8(DiskannHandle handle) {
 
 bool DiskannDetachedIsQuantized(DiskannHandle handle) {
 	return diskann_detached_is_quantized(handle) != 0;
+}
+
+// ========================================
+// Batch search wrapper
+// ========================================
+
+DiskannBatchSearchResult DiskannBatchSearch(const std::string &name, const float *query_matrix, int32_t nq,
+                                            int32_t dimension, int32_t k, int32_t search_complexity) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	DiskannBatchSearchResult result;
+	result.labels.resize(static_cast<size_t>(nq) * k, -1);
+	result.distances.resize(static_cast<size_t>(nq) * k, std::numeric_limits<float>::max());
+	result.counts.resize(nq, 0);
+
+	int32_t rc =
+	    diskann_batch_search_buf(name.c_str(), query_matrix, nq, dimension, k, search_complexity, result.labels.data(),
+	                             result.distances.data(), result.counts.data(), err_buf, ERR_BUF_LEN);
+	if (rc != 0) {
+		throw std::runtime_error("DiskANN batch search: " + std::string(err_buf));
+	}
+	return result;
 }
 
 } // namespace duckdb
