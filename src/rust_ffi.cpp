@@ -54,6 +54,10 @@ void diskann_free_label_map(uint32_t *map, size_t map_len);
 
 // Vector accessor
 int32_t diskann_detached_get_vector(void *handle, uint32_t label, float *out_vec, int32_t out_capacity);
+
+// SQ8 Quantization
+int32_t diskann_detached_quantize_sq8(void *handle);
+int32_t diskann_detached_is_quantized(void *handle);
 }
 
 namespace duckdb {
@@ -171,6 +175,18 @@ void DiskannFreeLabelMap(uint32_t *map, size_t map_len) {
 
 int32_t DiskannDetachedGetVector(DiskannHandle handle, uint32_t label, float *out_vec, int32_t capacity) {
 	return diskann_detached_get_vector(handle, label, out_vec, capacity);
+}
+
+// ========================================
+// SQ8 Quantization wrappers
+// ========================================
+
+void DiskannDetachedQuantizeSQ8(DiskannHandle handle) {
+	diskann_detached_quantize_sq8(handle);
+}
+
+bool DiskannDetachedIsQuantized(DiskannHandle handle) {
+	return diskann_detached_is_quantized(handle) != 0;
 }
 
 } // namespace duckdb

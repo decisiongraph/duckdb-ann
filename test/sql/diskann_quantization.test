@@ -1,0 +1,90 @@
+# name: test/sql/diskann_quantization.test
+# description: Test SQ8 scalar quantization for DiskANN indexes
+# group: [diskann]
+
+require annsearch
+
+# Create table with vectors
+statement ok
+CREATE TABLE qvectors (id INT, embedding FLOAT[4]);
+
+statement ok
+INSERT INTO qvectors VALUES
+  (1, [1.0, 0.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0, 0.0]),
+  (3, [0.0, 0.0, 1.0, 0.0]),
+  (4, [0.0, 0.0, 0.0, 1.0]),
+  (5, [0.5, 0.5, 0.0, 0.0]),
+  (6, [0.0, 0.5, 0.5, 0.0]),
+  (7, [0.25, 0.25, 0.25, 0.25]),
+  (8, [1.0, 1.0, 0.0, 0.0]),
+  (9, [0.0, 0.0, 1.0, 1.0]),
+  (10, [0.5, 0.0, 0.5, 0.0]);
+
+# Create DISKANN index with SQ8 quantization
+statement ok
+CREATE INDEX sq8_idx ON qvectors USING DISKANN (embedding) WITH (quantization='sq8');
+
+# Verify index exists
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'sq8_idx';
+----
+1
+
+# Verify quantization reported in diagnostics
+query I
+SELECT quantized FROM annsearch_index_info() WHERE name = 'sq8_idx';
+----
+true
+
+# Search nearest to [1,0,0,0] — exact match should be id=1
+query I
+SELECT v.id
+FROM diskann_index_scan('qvectors', 'sq8_idx', [1.0, 0.0, 0.0, 0.0], 3) s
+JOIN qvectors v ON v.rowid = s.row_id
+ORDER BY s.distance
+LIMIT 1;
+----
+1
+
+# Search nearest to [0.5,0.5,0,0] — id=5 is exact match
+query I
+SELECT v.id
+FROM diskann_index_scan('qvectors', 'sq8_idx', [0.5, 0.5, 0.0, 0.0], 3) s
+JOIN qvectors v ON v.rowid = s.row_id
+ORDER BY s.distance
+LIMIT 1;
+----
+5
+
+# Search nearest to [0.25,0.25,0.25,0.25] — id=7 is exact match
+query I
+SELECT v.id
+FROM diskann_index_scan('qvectors', 'sq8_idx', [0.25, 0.25, 0.25, 0.25], 3) s
+JOIN qvectors v ON v.rowid = s.row_id
+ORDER BY s.distance
+LIMIT 1;
+----
+7
+
+# Create non-quantized index for comparison
+statement ok
+CREATE INDEX noquant_idx ON qvectors USING DISKANN (embedding);
+
+# Non-quantized should not be reported as quantized
+query I
+SELECT quantized FROM annsearch_index_info() WHERE name = 'noquant_idx';
+----
+false
+
+# ann_search should also work with quantized index
+query I
+SELECT id FROM ann_search('qvectors', 'sq8_idx', [1.0, 0.0, 0.0, 0.0]::FLOAT[4], 1);
+----
+1
+
+# Optimizer path should also work with quantized index
+query I
+SELECT id FROM qvectors ORDER BY array_distance(embedding, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+1

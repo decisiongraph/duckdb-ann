@@ -82,4 +82,8 @@ DiskannStreamingBuildResult DiskannStreamingBuild(const std::string &input_path,
                                                   const std::string &metric, int32_t max_degree,
                                                   int32_t build_complexity, float alpha, int32_t sample_size);
 
+// SQ8 Quantization
+void DiskannDetachedQuantizeSQ8(DiskannHandle handle);
+bool DiskannDetachedIsQuantized(DiskannHandle handle);
+
 } // namespace duckdb

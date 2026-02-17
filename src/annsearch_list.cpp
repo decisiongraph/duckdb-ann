@@ -108,6 +108,8 @@ void RegisterAnnsearchListFunction(ExtensionLoader &loader) {
 		names.push_back("num_deleted");
 		return_types.push_back(LogicalType::BIGINT);
 		names.push_back("memory_bytes");
+		return_types.push_back(LogicalType::BOOLEAN);
+		names.push_back("quantized");
 		return make_uniq<TableFunctionData>();
 	};
 
@@ -118,6 +120,7 @@ void RegisterAnnsearchListFunction(ExtensionLoader &loader) {
 		int64_t num_vectors = 0;
 		int64_t num_deleted = 0;
 		int64_t memory_bytes = 0;
+		bool quantized = false;
 	};
 
 	struct InfoState : public GlobalTableFunctionState {
@@ -167,6 +170,7 @@ void RegisterAnnsearchListFunction(ExtensionLoader &loader) {
 							e.num_deleted = static_cast<int64_t>(diskann.GetDeletedCount());
 							auto &bound = static_cast<BoundIndex &>(diskann);
 							e.memory_bytes = static_cast<int64_t>(bound.GetInMemorySize());
+							e.quantized = diskann.IsQuantized();
 						}
 #ifdef FAISS_AVAILABLE
 						else if (idx_type == "FAISS") {
@@ -202,6 +206,7 @@ void RegisterAnnsearchListFunction(ExtensionLoader &loader) {
 			output.SetValue(3, i, Value::BIGINT(e.num_vectors));
 			output.SetValue(4, i, Value::BIGINT(e.num_deleted));
 			output.SetValue(5, i, Value::BIGINT(e.memory_bytes));
+			output.SetValue(6, i, Value::BOOLEAN(e.quantized));
 		}
 		state.position += chunk_size;
 		output.SetCardinality(chunk_size);

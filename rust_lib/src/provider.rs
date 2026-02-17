@@ -22,6 +22,21 @@ use parking_lot::RwLock;
 // Storage
 // ==================
 
+/// SQ8 quantization parameters: per-dimension min and scale.
+/// Dequantize: val = (quantized / 255.0) * scale + min
+#[derive(Debug, Clone)]
+pub struct SQ8Params {
+    pub min: Vec<f32>,
+    pub scale: Vec<f32>,
+}
+
+/// Optional quantized storage alongside full precision.
+#[derive(Debug)]
+struct QuantizedStorage {
+    data: Vec<u8>, // [id * dim .. (id+1) * dim] as u8
+    params: SQ8Params,
+}
+
 #[derive(Debug)]
 struct Inner {
     /// Flat contiguous vector storage: [id*dim .. (id+1)*dim]
@@ -34,6 +49,8 @@ struct Inner {
     max_degree: usize,
     dimension: usize,
     metric: Metric,
+    /// Optional SQ8 quantized storage (set after bulk build)
+    quantized: RwLock<Option<QuantizedStorage>>,
 }
 
 /// Newtype wrapper for the in-memory provider, allowing trait impls.
@@ -50,6 +67,7 @@ impl Provider {
             max_degree,
             dimension,
             metric,
+            quantized: RwLock::new(None),
         }))
     }
 
@@ -71,6 +89,7 @@ impl Provider {
             max_degree,
             dimension,
             metric,
+            quantized: RwLock::new(None),
         });
 
         for (id, neighbors) in adjacency_lists.into_iter().enumerate() {
@@ -102,19 +121,123 @@ impl Provider {
     }
 
     /// Get a copy of the vector data for the given id.
+    /// If SQ8 is active and the vector is in quantized range, dequantizes.
     pub fn get_vector(&self, id: u32) -> Option<Vec<f32>> {
-        let vecs = self.0.vectors.read();
-        let offset = id as usize * self.0.dimension;
-        if offset + self.0.dimension <= vecs.len() {
-            Some(vecs[offset..offset + self.0.dimension].to_vec())
-        } else {
-            None
+        let dim = self.0.dimension;
+        let offset = id as usize * dim;
+
+        // Try full precision first
+        {
+            let vecs = self.0.vectors.read();
+            if offset + dim <= vecs.len() {
+                return Some(vecs[offset..offset + dim].to_vec());
+            }
         }
+
+        // Fall back to quantized storage
+        let q_guard = self.0.quantized.read();
+        if let Some(q) = q_guard.as_ref() {
+            if offset + dim <= q.data.len() {
+                let mut result = vec![0.0f32; dim];
+                for d in 0..dim {
+                    result[d] =
+                        (q.data[offset + d] as f32 / 255.0) * q.params.scale[d] + q.params.min[d];
+                }
+                return Some(result);
+            }
+        }
+        None
     }
 
     /// Get a copy of the neighbor list for the given id.
     pub fn get_neighbors(&self, id: u32) -> Option<Vec<u32>> {
         self.0.adjacency.get(&id).map(|adj| adj.to_vec())
+    }
+
+    /// Quantize all existing vectors to SQ8 (u8 per dimension).
+    /// Computes per-dimension min/max, scales to [0, 255].
+    /// Full precision vectors are kept for new inserts; quantized data
+    /// is used for search (dequantized on the fly in get_element).
+    pub fn quantize_sq8(&self) {
+        let vecs = self.0.vectors.read();
+        let count = self.0.count.load(Ordering::Relaxed) as usize;
+        let dim = self.0.dimension;
+        if count == 0 || dim == 0 {
+            return;
+        }
+
+        // Compute per-dimension min/max
+        let mut mins = vec![f32::MAX; dim];
+        let mut maxs = vec![f32::MIN; dim];
+        for i in 0..count {
+            let offset = i * dim;
+            for d in 0..dim {
+                let val = vecs[offset + d];
+                if val < mins[d] {
+                    mins[d] = val;
+                }
+                if val > maxs[d] {
+                    maxs[d] = val;
+                }
+            }
+        }
+
+        // Compute scale per dimension
+        let mut scale = vec![0.0f32; dim];
+        for d in 0..dim {
+            let range = maxs[d] - mins[d];
+            scale[d] = if range > 0.0 { range } else { 1.0 };
+        }
+
+        // Quantize to u8
+        let mut quantized = vec![0u8; count * dim];
+        for i in 0..count {
+            let offset = i * dim;
+            for d in 0..dim {
+                let normalized = (vecs[offset + d] - mins[d]) / scale[d];
+                quantized[offset + d] = (normalized * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+
+        let params = SQ8Params {
+            min: mins,
+            scale,
+        };
+        *self.0.quantized.write() = Some(QuantizedStorage {
+            data: quantized,
+            params,
+        });
+    }
+
+    /// Whether SQ8 quantization is active.
+    pub fn is_quantized(&self) -> bool {
+        self.0.quantized.read().is_some()
+    }
+
+    /// Get SQ8 params (for serialization).
+    pub fn get_sq8_params(&self) -> Option<SQ8Params> {
+        self.0.quantized.read().as_ref().map(|q| q.params.clone())
+    }
+
+    /// Get raw quantized data (for serialization).
+    pub fn get_quantized_data(&self) -> Option<Vec<u8>> {
+        self.0.quantized.read().as_ref().map(|q| q.data.clone())
+    }
+
+    /// Load quantized data from deserialization.
+    pub fn load_sq8(&self, data: Vec<u8>, params: SQ8Params) {
+        *self.0.quantized.write() = Some(QuantizedStorage { data, params });
+    }
+
+    /// Memory used by vector storage (full precision + quantized).
+    pub fn vector_memory_bytes(&self) -> usize {
+        let vecs = self.0.vectors.read();
+        let mut size = vecs.len() * std::mem::size_of::<f32>();
+        if let Some(q) = self.0.quantized.read().as_ref() {
+            size += q.data.len();
+            size += q.params.min.len() * std::mem::size_of::<f32>() * 2;
+        }
+        size
     }
 
     pub fn dim(&self) -> usize {
@@ -393,14 +516,33 @@ impl provider::Accessor for ProviderAccessor<'_> {
     type GetError = ProviderError;
 
     async fn get_element(&mut self, id: u32) -> Result<&[f32], ProviderError> {
-        let vecs = self.inner.vectors.read();
-        let offset = id as usize * self.inner.dimension;
-        if offset + self.inner.dimension <= vecs.len() {
-            self.buffer.copy_from_slice(&vecs[offset..offset + self.inner.dimension]);
-            Ok(&*self.buffer)
-        } else {
-            Err(ProviderError(id))
+        let dim = self.inner.dimension;
+        let offset = id as usize * dim;
+
+        // Try full precision first
+        {
+            let vecs = self.inner.vectors.read();
+            if offset + dim <= vecs.len() {
+                self.buffer.copy_from_slice(&vecs[offset..offset + dim]);
+                return Ok(&*self.buffer);
+            }
         }
+
+        // Fall back to quantized storage (dequantize into buffer)
+        {
+            let q_guard = self.inner.quantized.read();
+            if let Some(q) = q_guard.as_ref() {
+                if offset + dim <= q.data.len() {
+                    for d in 0..dim {
+                        self.buffer[d] = (q.data[offset + d] as f32 / 255.0) * q.params.scale[d]
+                            + q.params.min[d];
+                    }
+                    return Ok(&*self.buffer);
+                }
+            }
+        }
+
+        Err(ProviderError(id))
     }
 }
 

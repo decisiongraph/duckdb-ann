@@ -349,10 +349,34 @@ impl InMemoryIndex {
     }
 
     /// Serialize the index to bytes (reuses the .diskann binary format).
+    /// If SQ8 is active, appends quantization data after the standard format.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>> {
         let mut cursor = Cursor::new(Vec::new());
         file_format::write_index(&mut cursor, &self.provider, self.metric, self.build_complexity)
             .map_err(|e| anyhow!("Serialization error: {}", e))?;
+
+        // Append SQ8 data if quantized
+        if let Some(params) = self.provider.get_sq8_params() {
+            if let Some(qdata) = self.provider.get_quantized_data() {
+                use std::io::Write;
+                let marker = b"SQ8\0";
+                cursor.write_all(marker)?;
+                let dim = self.dimension as u32;
+                cursor.write_all(&dim.to_le_bytes())?;
+                let qlen = qdata.len() as u64;
+                cursor.write_all(&qlen.to_le_bytes())?;
+                // Write min + scale params
+                for v in &params.min {
+                    cursor.write_all(&v.to_le_bytes())?;
+                }
+                for v in &params.scale {
+                    cursor.write_all(&v.to_le_bytes())?;
+                }
+                // Write quantized data
+                cursor.write_all(&qdata)?;
+            }
+        }
+
         Ok(cursor.into_inner())
     }
 
@@ -449,6 +473,38 @@ impl InMemoryIndex {
 
         let index = DiskANNIndex::new(config, provider.clone(), None);
 
+        // Check for SQ8 data appended after the standard format
+        let standard_end = adj_offset + adj_size;
+        if data.len() > standard_end + 4 && &data[standard_end..standard_end + 4] == b"SQ8\0" {
+            let sq_offset = standard_end + 4;
+            let sq_dim = u32::from_le_bytes(data[sq_offset..sq_offset + 4].try_into().unwrap()) as usize;
+            let qlen = u64::from_le_bytes(data[sq_offset + 4..sq_offset + 12].try_into().unwrap()) as usize;
+            let params_offset = sq_offset + 12;
+
+            // Read min + scale
+            let mut mins = vec![0.0f32; sq_dim];
+            let mut scales = vec![0.0f32; sq_dim];
+            for d in 0..sq_dim {
+                let off = params_offset + d * 4;
+                mins[d] = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            }
+            for d in 0..sq_dim {
+                let off = params_offset + sq_dim * 4 + d * 4;
+                scales[d] = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            }
+
+            let qdata_offset = params_offset + sq_dim * 8;
+            let qdata = data[qdata_offset..qdata_offset + qlen].to_vec();
+
+            provider.load_sq8(
+                qdata,
+                crate::provider::SQ8Params {
+                    min: mins,
+                    scale: scales,
+                },
+            );
+        }
+
         Ok(Self {
             name: String::new(),
             dimension,
@@ -505,6 +561,17 @@ impl InMemoryIndex {
     /// Get current vector count.
     pub fn len(&self) -> usize {
         self.provider.len()
+    }
+
+    /// Apply SQ8 scalar quantization to existing vectors.
+    /// Reduces memory by 4x for vector storage.
+    pub fn quantize_sq8(&self) {
+        self.provider.quantize_sq8();
+    }
+
+    /// Check if SQ8 quantization is active.
+    pub fn is_quantized(&self) -> bool {
+        self.provider.is_quantized()
     }
 
     fn single_vector_distance(&self, query: &[f32]) -> f32 {

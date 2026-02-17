@@ -121,6 +121,11 @@ DiskannIndex::DiskannIndex(const string &name, IndexConstraintType constraint_ty
 			build_complexity_ = kv.second.GetValue<int32_t>();
 		} else if (kv.first == "alpha") {
 			alpha_ = kv.second.GetValue<float>();
+		} else if (kv.first == "quantization") {
+			auto val = kv.second.ToString();
+			if (val == "sq8" || val == "SQ8") {
+				quantize_sq8_ = true;
+			}
 		}
 	}
 
@@ -222,6 +227,7 @@ public:
 	int32_t max_degree = 64;
 	int32_t build_complexity = 128;
 	float alpha = 1.2f;
+	bool quantize_sq8 = false;
 
 	~CreateDiskannGlobalSinkState() override {
 		if (rust_handle) {
@@ -249,6 +255,11 @@ unique_ptr<GlobalSinkState> PhysicalCreateDiskannIndex::GetGlobalSinkState(Clien
 			state->build_complexity = kv.second.GetValue<int32_t>();
 		} else if (kv.first == "alpha") {
 			state->alpha = kv.second.GetValue<float>();
+		} else if (kv.first == "quantization") {
+			auto val = kv.second.ToString();
+			if (val == "sq8" || val == "SQ8") {
+				state->quantize_sq8 = true;
+			}
 		}
 	}
 
@@ -323,6 +334,9 @@ SinkFinalizeType PhysicalCreateDiskannIndex::Finalize(Pipeline &pipeline, Event 
 	options["max_degree"] = Value::INTEGER(state.max_degree);
 	options["build_complexity"] = Value::INTEGER(state.build_complexity);
 	options["alpha"] = Value::FLOAT(state.alpha);
+	if (state.quantize_sq8) {
+		options["quantization"] = Value("sq8");
+	}
 
 	auto index = make_uniq<DiskannIndex>(info->index_name, info->constraint_type, storage_ids,
 	                                     TableIOManager::Get(storage), unbound_expressions, storage.db, options);
@@ -338,6 +352,12 @@ SinkFinalizeType PhysicalCreateDiskannIndex::Finalize(Pipeline &pipeline, Event 
 	index->label_to_rowid_ = std::move(state.label_to_rowid);
 	index->rowid_to_label_ = std::move(state.rowid_to_label);
 	index->is_dirty_ = true;
+
+	// Apply SQ8 quantization if requested
+	if (state.quantize_sq8 && index->rust_handle_) {
+		DiskannDetachedQuantizeSQ8(index->rust_handle_);
+		index->quantize_sq8_ = true;
+	}
 
 	// Call through BoundIndex reference to avoid name hiding from our overrides
 	BoundIndex &bi = *index;

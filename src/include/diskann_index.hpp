@@ -65,6 +65,9 @@ public:
 	idx_t GetDeletedCount() const {
 		return deleted_labels_.size();
 	}
+	bool IsQuantized() const {
+		return rust_handle_ ? DiskannDetachedIsQuantized(rust_handle_) : false;
+	}
 
 	// PhysicalCreateDiskannIndex needs to set internal state after build
 	friend class PhysicalCreateDiskannIndex;
@@ -82,6 +85,7 @@ private:
 	int32_t max_degree_ = 64;
 	int32_t build_complexity_ = 128;
 	float alpha_ = 1.2f;
+	bool quantize_sq8_ = false;
 
 	// Row ID mapping: internal label (0,1,2,...) <-> DuckDB row_t
 	vector<row_t> label_to_rowid_;

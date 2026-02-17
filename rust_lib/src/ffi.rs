@@ -785,3 +785,29 @@ pub unsafe extern "C" fn diskann_detached_get_vector(
         None => 0,
     }
 }
+
+// ========================================
+// SQ8 Quantization
+// ========================================
+
+/// Apply SQ8 scalar quantization to a detached index.
+/// Reduces vector memory by ~4x. Search will dequantize on the fly.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn diskann_detached_quantize_sq8(handle: DiskannHandle) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let index = &*handle;
+    index.quantize_sq8();
+    0
+}
+
+/// Check if a detached index has SQ8 quantization active.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn diskann_detached_is_quantized(handle: DiskannHandle) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let index = &*handle;
+    if index.is_quantized() { 1 } else { 0 }
+}
