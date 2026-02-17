@@ -59,6 +59,9 @@ public:
 	int32_t GetDimension() const {
 		return dimension_;
 	}
+	const string &GetMetric() const {
+		return metric_;
+	}
 	idx_t GetVectorCount() const {
 		return rust_handle_ ? static_cast<idx_t>(DiskannDetachedCount(rust_handle_)) : 0;
 	}

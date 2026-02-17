@@ -189,18 +189,51 @@ static bool ExtractQueryVector(const BoundConstantExpression &const_expr, vector
 	return false;
 }
 
-// Find an ANN index on a table that covers a specific column
+// Find an ANN index on a table that covers a specific column and is compatible
+// with the given distance function's required metric.
 struct FoundIndex {
 	string name;
 	bool is_diskann = true;
+	string metric = "L2";
 };
 
+// Map distance function name to required index metric
+static string RequiredMetric(const string &fn_name) {
+	if (fn_name == "array_inner_product" || fn_name == "list_inner_product") {
+		return "IP";
+	}
+	if (fn_name == "array_cosine_similarity" || fn_name == "list_cosine_similarity") {
+		return "cosine";
+	}
+	return "L2"; // array_distance, list_distance
+}
+
+static bool MetricCompatible(const string &index_metric, const string &required) {
+	if (required == "L2") {
+		return index_metric == "L2" || index_metric == "l2";
+	}
+	if (required == "IP") {
+		return index_metric == "IP" || index_metric == "ip" || index_metric == "inner_product";
+	}
+	if (required == "cosine") {
+		return index_metric == "cosine";
+	}
+	return false;
+}
+
 static bool FindAnnIndex(ClientContext &context, DuckTableEntry &duck_table, column_t physical_col,
-                         FoundIndex &result) {
+                         const string &fn_name, FoundIndex &result) {
 	auto &storage = duck_table.GetStorage();
 	auto &table_info = *storage.GetDataTableInfo();
 	auto &indexes = table_info.GetIndexes();
-	bool found = false;
+	auto required = RequiredMetric(fn_name);
+
+	// Collect candidate indexes on this column
+	struct Candidate {
+		string name;
+		bool is_diskann;
+	};
+	vector<Candidate> candidates;
 
 	indexes.Scan([&](Index &idx) {
 		auto type = idx.GetIndexType();
@@ -210,16 +243,41 @@ static bool FindAnnIndex(ClientContext &context, DuckTableEntry &duck_table, col
 		auto &col_ids = idx.GetColumnIds();
 		for (auto &cid : col_ids) {
 			if (cid == physical_col) {
-				result.name = idx.GetIndexName();
-				result.is_diskann = (type == "DISKANN");
-				found = true;
-				return true;
+				candidates.push_back({idx.GetIndexName(), type == "DISKANN"});
+				break;
 			}
 		}
 		return false;
 	});
 
-	return found;
+	// Bind indexes and find one with a compatible metric
+	for (auto &cand : candidates) {
+		string metric;
+		if (cand.is_diskann) {
+			indexes.Bind(context, table_info, DiskannIndex::TYPE_NAME);
+			auto idx_ptr = indexes.Find(cand.name);
+			if (idx_ptr) {
+				metric = idx_ptr->Cast<DiskannIndex>().GetMetric();
+			}
+		}
+#ifdef FAISS_AVAILABLE
+		else {
+			indexes.Bind(context, table_info, FaissIndex::TYPE_NAME);
+			auto idx_ptr = indexes.Find(cand.name);
+			if (idx_ptr) {
+				metric = idx_ptr->Cast<FaissIndex>().GetMetric();
+			}
+		}
+#endif
+		if (MetricCompatible(metric, required)) {
+			result.name = cand.name;
+			result.is_diskann = cand.is_diskann;
+			result.metric = metric;
+			return true;
+		}
+	}
+
+	return false;
 }
 
 // Try to optimize an ORDER BY node by rewriting to ANN index scan
@@ -317,9 +375,9 @@ static bool TryOptimizeOrderBy(ClientContext &context, unique_ptr<LogicalOperato
 	}
 	auto &duck_table = table_ptr->Cast<DuckTableEntry>();
 
-	// Find an ANN index on this column
+	// Find a metric-compatible ANN index on this column
 	FoundIndex found_idx;
-	if (!FindAnnIndex(context, duck_table, physical_col, found_idx)) {
+	if (!FindAnnIndex(context, duck_table, physical_col, fn_name, found_idx)) {
 		return false;
 	}
 

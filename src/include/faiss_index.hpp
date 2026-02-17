@@ -61,6 +61,9 @@ public:
 	int32_t GetDimension() const {
 		return dimension_;
 	}
+	const string &GetMetric() const {
+		return metric_;
+	}
 	idx_t GetVectorCount() const {
 		return faiss_index_ ? static_cast<idx_t>(faiss_index_->ntotal) : 0;
 	}

@@ -213,6 +213,49 @@ statement ok
 DROP TABLE vac_vectors;
 
 # ========================================
+# MergeIndexes: post-creation inserts are merged
+# ========================================
+
+statement ok
+CREATE TABLE merge_vectors (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO merge_vectors VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]);
+
+statement ok
+CREATE INDEX merge_idx ON merge_vectors USING FAISS (embedding);
+
+# Insert more rows after index creation (triggers MergeIndexes)
+statement ok
+INSERT INTO merge_vectors VALUES
+  (3, [0.0, 0.0, 1.0]),
+  (4, [0.9, 0.1, 0.0]);
+
+# All 4 vectors should be searchable
+query I
+SELECT count(*) FROM faiss_index_scan('merge_vectors', 'merge_idx', [1.0, 0.0, 0.0], 4);
+----
+4
+
+# Nearest to [1,0,0] should be id=1, then id=4
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('merge_vectors', 'merge_idx', [1.0, 0.0, 0.0], 2) s
+JOIN merge_vectors v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.0
+4	0.020000001
+
+statement ok
+DROP INDEX merge_idx;
+
+statement ok
+DROP TABLE merge_vectors;
+
+# ========================================
 # Error: wrong dimension query
 # ========================================
 

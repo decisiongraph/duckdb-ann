@@ -97,6 +97,64 @@ LIMIT 2;
 1	0.0	1
 4	0.70710677	4
 
+# ========================================
+# Cosine similarity should NOT rewrite on L2 index (issue #28)
+# The optimizer must not use an L2 index for cosine queries
+# ========================================
+
+query IR
+SELECT id, array_cosine_similarity(embedding, [1.0, 0.0, 0.0]::FLOAT[3]) AS sim
+FROM docs
+ORDER BY sim
+LIMIT 3;
+----
+2	0.0
+3	0.0
+5	0.0
+
+# Verify EXPLAIN shows no ANN_INDEX_SCAN for cosine on L2 index
+query II
+EXPLAIN SELECT id, array_cosine_similarity(embedding, [1.0, 0.0, 0.0]::FLOAT[3]) AS sim
+FROM docs ORDER BY sim LIMIT 2;
+----
+physical_plan	<REGEX>:.*ORDER_BY.*
+
+# ========================================
+# Inner product should NOT rewrite on L2 index
+# ========================================
+
+query II
+EXPLAIN SELECT id, array_inner_product(embedding, [1.0, 0.0, 0.0]::FLOAT[3]) AS ip
+FROM docs ORDER BY ip LIMIT 2;
+----
+physical_plan	<REGEX>:.*ORDER_BY.*
+
+# ========================================
+# array_distance on IP index should NOT rewrite
+# ========================================
+
+statement ok
+CREATE TABLE ip_docs (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO ip_docs SELECT i, [random()::FLOAT, random()::FLOAT, random()::FLOAT] FROM range(100) t(i);
+
+statement ok
+CREATE INDEX ip_opt_idx ON ip_docs USING FAISS (embedding) WITH (metric = 'IP');
+
+# L2 distance on IP index should NOT rewrite
+query II
+EXPLAIN SELECT id, array_distance(embedding, [1.0, 0.0, 0.0]::FLOAT[3]) AS dist
+FROM ip_docs ORDER BY dist LIMIT 2;
+----
+physical_plan	<REGEX>:.*ORDER_BY.*
+
+statement ok
+DROP INDEX ip_opt_idx;
+
+statement ok
+DROP TABLE ip_docs;
+
 # Clean up
 statement ok
 DROP INDEX faiss_idx;

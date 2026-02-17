@@ -687,8 +687,9 @@ vector<pair<row_t, float>> FaissIndex::Search(const float *query, int32_t dimens
 		return {};
 	}
 
-	int32_t request_k = k + static_cast<int32_t>(deleted_labels_.size());
-	request_k = MinValue<int32_t>(request_k, static_cast<int32_t>(faiss_index_->ntotal));
+	int64_t request_k64 = static_cast<int64_t>(k) + static_cast<int64_t>(deleted_labels_.size());
+	request_k64 = MinValue<int64_t>(request_k64, static_cast<int64_t>(faiss_index_->ntotal));
+	int32_t request_k = static_cast<int32_t>(MinValue<int64_t>(request_k64, static_cast<int64_t>(INT32_MAX)));
 	if (request_k <= 0) {
 		return {};
 	}
@@ -752,6 +753,58 @@ idx_t FaissIndex::GetInMemorySize(IndexLock &state) {
 }
 
 bool FaissIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
+	auto &other = other_index.Cast<FaissIndex>();
+
+	if (!other.faiss_index_ || !faiss_index_) {
+		is_dirty_ = true;
+		return true;
+	}
+
+	auto other_ntotal = other.faiss_index_->ntotal;
+	if (other_ntotal == 0) {
+		is_dirty_ = true;
+		return true;
+	}
+
+	// Bulk-extract all vectors from the other index (same API as Vacuum:772)
+	vector<float> all_vectors(other_ntotal * dimension_);
+	other.faiss_index_->reconstruct_n(0, other_ntotal, all_vectors.data());
+
+	// Collect surviving (non-deleted) vectors and their row IDs
+	vector<float> kept_vectors;
+	vector<row_t> kept_rowids;
+	kept_vectors.reserve(other_ntotal * dimension_);
+	kept_rowids.reserve(other_ntotal);
+
+	for (int64_t label = 0; label < other_ntotal; label++) {
+		if (other.deleted_labels_.count(label) > 0) {
+			continue;
+		}
+		if (label >= static_cast<int64_t>(other.label_to_rowid_.size())) {
+			continue;
+		}
+		kept_vectors.insert(kept_vectors.end(), all_vectors.data() + label * dimension_,
+		                    all_vectors.data() + (label + 1) * dimension_);
+		kept_rowids.push_back(other.label_to_rowid_[label]);
+	}
+
+	// Batch-add to this index and rebuild mappings
+	if (!kept_rowids.empty()) {
+		auto base_label = faiss_index_->ntotal;
+		faiss_index_->add(static_cast<faiss::idx_t>(kept_rowids.size()), kept_vectors.data());
+
+		auto new_size = base_label + static_cast<int64_t>(kept_rowids.size());
+		if (new_size > static_cast<int64_t>(label_to_rowid_.size())) {
+			label_to_rowid_.resize(new_size, -1);
+		}
+		for (size_t i = 0; i < kept_rowids.size(); i++) {
+			auto new_label = base_label + static_cast<int64_t>(i);
+			label_to_rowid_[new_label] = kept_rowids[i];
+			rowid_to_label_[kept_rowids[i]] = new_label;
+		}
+	}
+
+	InvalidateGpuIndex();
 	is_dirty_ = true;
 	return true;
 }

@@ -551,8 +551,10 @@ vector<pair<row_t, float>> DiskannIndex::Search(const float *query, int32_t dime
 		return {};
 	}
 
-	int32_t request_k = k + static_cast<int32_t>(deleted_labels_.size());
-	request_k = MinValue<int32_t>(request_k, static_cast<int32_t>(DiskannDetachedCount(rust_handle_)));
+	int64_t request_k64 = static_cast<int64_t>(k) + static_cast<int64_t>(deleted_labels_.size());
+	int64_t total_count = static_cast<int64_t>(DiskannDetachedCount(rust_handle_));
+	request_k64 = MinValue<int64_t>(request_k64, total_count);
+	int32_t request_k = static_cast<int32_t>(MinValue<int64_t>(request_k64, static_cast<int64_t>(INT32_MAX)));
 	if (request_k <= 0) {
 		return {};
 	}
