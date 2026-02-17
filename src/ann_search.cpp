@@ -309,8 +309,8 @@ static void AnnSearchBatchScan(ClientContext &context, TableFunctionInput &data,
 				return false;
 			});
 
-			for (auto &[row_id, dist] : results) {
-				state.results.push_back({qi, row_id, dist});
+			for (auto &pair : results) {
+				state.results.push_back({qi, pair.first, pair.second});
 			}
 		}
 	}

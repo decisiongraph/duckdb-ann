@@ -10,6 +10,14 @@ use memmap2::Mmap;
 use crate::file_format::{FileHeader, HEADER_SIZE, MAGIC, VERSION};
 use crate::index_manager::Metric;
 
+/// Bounds-checked u32 read from a byte slice, returning io::Error on truncation.
+fn read_u32_io(data: &[u8], offset: usize) -> io::Result<u32> {
+    data.get(offset..offset + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("truncated at offset {}", offset)))
+}
+
 /// Reusable search buffers to avoid per-query allocations.
 struct SearchContext {
     visited: hashbrown::HashSet<u32>,
@@ -72,7 +80,7 @@ impl DiskProvider {
             ));
         }
 
-        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        let version = read_u32_io(&mmap, 4)?;
         if version != VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -80,13 +88,13 @@ impl DiskProvider {
             ));
         }
 
-        let num_vectors = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
-        let dimension = u32::from_le_bytes(mmap[12..16].try_into().unwrap());
-        let max_degree = u32::from_le_bytes(mmap[16..20].try_into().unwrap());
-        let num_entry_points = u32::from_le_bytes(mmap[20..24].try_into().unwrap());
+        let num_vectors = read_u32_io(&mmap, 8)?;
+        let dimension = read_u32_io(&mmap, 12)?;
+        let max_degree = read_u32_io(&mmap, 16)?;
+        let num_entry_points = read_u32_io(&mmap, 20)?;
         let metric_byte = mmap[24];
         // bytes 25..28: padding
-        let build_complexity = u32::from_le_bytes(mmap[28..32].try_into().unwrap());
+        let build_complexity = read_u32_io(&mmap, 28)?;
 
         let header = FileHeader {
             num_vectors,
@@ -115,8 +123,7 @@ impl DiskProvider {
         let mut entry_point_ids = Vec::with_capacity(num_entry_points as usize);
         for i in 0..num_entry_points as usize {
             let off = ep_offset + i * 4;
-            let id = u32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
-            entry_point_ids.push(id);
+            entry_point_ids.push(read_u32_io(&mmap, off)?);
         }
 
         let metric = header.metric_enum();

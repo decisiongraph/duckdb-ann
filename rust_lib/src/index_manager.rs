@@ -19,6 +19,42 @@ use crate::file_format;
 use crate::provider::{DefaultContext, FullPrecisionStrategy, Provider};
 use crate::runtime;
 
+// Bounds-checked byte readers for safe deserialization of untrusted data.
+
+fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
+    data.get(offset..offset + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| anyhow!("truncated data at offset {}", offset))
+}
+
+fn read_u64_le(data: &[u8], offset: usize) -> Result<u64> {
+    data.get(offset..offset + 8)
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| anyhow!("truncated data at offset {}", offset))
+}
+
+fn read_f32(data: &[u8], offset: usize) -> Result<f32> {
+    data.get(offset..offset + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(f32::from_le_bytes)
+        .ok_or_else(|| anyhow!("truncated data at offset {}", offset))
+}
+
+/// Read a contiguous block of f32 values from a byte slice.
+fn read_f32_vec(data: &[u8], offset: usize, count: usize) -> Result<Vec<f32>> {
+    let byte_len = count.checked_mul(4).ok_or_else(|| anyhow!("overflow computing f32 vec size"))?;
+    let end = offset.checked_add(byte_len).ok_or_else(|| anyhow!("overflow computing f32 vec end"))?;
+    if end > data.len() {
+        return Err(anyhow!("truncated data: need {} bytes at offset {}, have {}", byte_len, offset, data.len()));
+    }
+    Ok(data[offset..end]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 /// Global index registry.
 static INDEXES: LazyLock<DashMap<String, Arc<ManagedIndex>>> = LazyLock::new(DashMap::new);
 
@@ -235,8 +271,7 @@ impl InMemoryIndex {
 
         // Slow path: first vector, need write lock
         let mut idx_guard = self.index.write();
-        if idx_guard.is_some() {
-            let index = idx_guard.as_ref().unwrap();
+        if let Some(index) = idx_guard.as_ref() {
             let strategy = FullPrecisionStrategy::new();
             let ctx = DefaultContext;
             runtime::block_on(index.insert(strategy, &ctx, &label, vector))
@@ -383,48 +418,47 @@ impl InMemoryIndex {
     /// Reconstruct an InMemoryIndex from serialized bytes.
     pub fn from_bytes(data: &[u8], alpha: f32) -> Result<Self> {
         if data.len() < file_format::HEADER_SIZE {
-            return Err(anyhow!("Data too small for header"));
+            return Err(anyhow!("Data too small for header ({} bytes)", data.len()));
         }
         if &data[..4] != file_format::MAGIC {
             return Err(anyhow!("Invalid magic bytes"));
         }
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let version = read_u32(data, 4)?;
         if version != file_format::VERSION {
             return Err(anyhow!("Unsupported version {}", version));
         }
 
-        let num_vectors = u32::from_le_bytes(data[8..12].try_into().unwrap());
-        let dimension = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
-        let max_degree = u32::from_le_bytes(data[16..20].try_into().unwrap());
-        let num_entry_points = u32::from_le_bytes(data[20..24].try_into().unwrap());
+        let num_vectors = read_u32(data, 8)?;
+        let dimension = read_u32(data, 12)? as usize;
+        let max_degree = read_u32(data, 16)?;
+        let num_entry_points = read_u32(data, 20)?;
         let metric_byte = data[24];
-        let build_complexity = u32::from_le_bytes(data[28..32].try_into().unwrap());
+        let build_complexity = read_u32(data, 28)?;
+
+        if dimension == 0 {
+            return Err(anyhow!("Invalid dimension 0"));
+        }
 
         let metric = match metric_byte {
             1 => Metric::InnerProduct,
             _ => Metric::L2,
         };
 
-        // Read entry points
+        // Read entry points (bounds-checked per element)
         let ep_offset = file_format::HEADER_SIZE;
         let mut entry_points = Vec::with_capacity(num_entry_points as usize);
         for i in 0..num_entry_points as usize {
             let off = ep_offset + i * 4;
-            entry_points.push(u32::from_le_bytes(data[off..off + 4].try_into().unwrap()));
+            entry_points.push(read_u32(data, off)?);
         }
 
         // Read flat vectors
         let vec_offset = ep_offset + num_entry_points as usize * 4;
-        let vec_size = num_vectors as usize * dimension * 4;
-        if data.len() < vec_offset + vec_size {
-            return Err(anyhow!("Data too small for vectors"));
-        }
-        let flat_vectors: Vec<f32> = data[vec_offset..vec_offset + vec_size]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let total_floats = num_vectors as usize * dimension;
+        let flat_vectors = read_f32_vec(data, vec_offset, total_floats)?;
 
         // Read adjacency lists
+        let vec_size = total_floats * 4;
         let adj_offset = vec_offset + vec_size;
         let deg = max_degree as usize;
         let adj_size = num_vectors as usize * deg * 4;
@@ -436,8 +470,7 @@ impl InMemoryIndex {
             let row_offset = adj_offset + i * deg * 4;
             let mut neighbors = Vec::new();
             for j in 0..deg {
-                let off = row_offset + j * 4;
-                let val = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                let val = read_u32(data, row_offset + j * 4)?;
                 if val == u32::MAX {
                     break;
                 }
@@ -477,23 +510,32 @@ impl InMemoryIndex {
         let standard_end = adj_offset + adj_size;
         if data.len() > standard_end + 4 && &data[standard_end..standard_end + 4] == b"SQ8\0" {
             let sq_offset = standard_end + 4;
-            let sq_dim = u32::from_le_bytes(data[sq_offset..sq_offset + 4].try_into().unwrap()) as usize;
-            let qlen = u64::from_le_bytes(data[sq_offset + 4..sq_offset + 12].try_into().unwrap()) as usize;
+            let sq_dim = read_u32(data, sq_offset)? as usize;
+            let qlen = read_u64_le(data, sq_offset + 4)? as usize;
             let params_offset = sq_offset + 12;
 
-            // Read min + scale
-            let mut mins = vec![0.0f32; sq_dim];
-            let mut scales = vec![0.0f32; sq_dim];
-            for d in 0..sq_dim {
-                let off = params_offset + d * 4;
-                mins[d] = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-            }
-            for d in 0..sq_dim {
-                let off = params_offset + sq_dim * 4 + d * 4;
-                scales[d] = f32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            // Validate SQ8 section fits in data
+            let sq_params_size = sq_dim * 8; // min + scale, each sq_dim * 4 bytes
+            let sq_total = params_offset + sq_params_size + qlen;
+            if sq_total > data.len() {
+                return Err(anyhow!(
+                    "SQ8 section truncated: need {} bytes, have {}",
+                    sq_total,
+                    data.len()
+                ));
             }
 
-            let qdata_offset = params_offset + sq_dim * 8;
+            // Read min + scale
+            let mut mins = Vec::with_capacity(sq_dim);
+            let mut scales = Vec::with_capacity(sq_dim);
+            for d in 0..sq_dim {
+                mins.push(read_f32(data, params_offset + d * 4)?);
+            }
+            for d in 0..sq_dim {
+                scales.push(read_f32(data, params_offset + sq_dim * 4 + d * 4)?);
+            }
+
+            let qdata_offset = params_offset + sq_params_size;
             let qdata = data[qdata_offset..qdata_offset + qlen].to_vec();
 
             provider.load_sq8(

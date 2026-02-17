@@ -24,8 +24,8 @@ struct VecFileHeader {
 fn read_vec_header(r: &mut impl Read) -> io::Result<VecFileHeader> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
-    let num_vectors = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    let dimension = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    let num_vectors = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let dimension = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     Ok(VecFileHeader { num_vectors, dimension })
 }
 
@@ -35,7 +35,7 @@ fn read_vector(r: &mut impl Read, dim: usize) -> io::Result<Vec<f32>> {
     r.read_exact(&mut bytes)?;
     let floats: Vec<f32> = bytes
         .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     Ok(floats)
 }
