@@ -2,7 +2,7 @@
 # description: Test ann_search_table streaming TABLE-input batch search
 # group: [diskann]
 
-require annsearch
+require ann
 
 # Create table with vectors
 statement ok

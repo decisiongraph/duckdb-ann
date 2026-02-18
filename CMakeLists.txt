@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-set(TARGET_NAME annsearch)
+set(TARGET_NAME ann)
 
 # ========================================
 # 1. Rust DiskANN library (staticlib via cargo)
@@ -173,13 +173,13 @@ include_directories(src/include)
 
 # Core sources (always compiled)
 set(EXTENSION_SOURCES
-    src/annsearch_extension.cpp
+    src/ann_extension.cpp
     src/ann_search.cpp
     src/ann_optimizer.cpp
     src/diskann_functions.cpp
     src/diskann_index.cpp
     src/rust_ffi.cpp
-    src/annsearch_list.cpp
+    src/ann_list.cpp
 )
 
 # FAISS sources (conditionally compiled via #ifdef FAISS_AVAILABLE in each file)

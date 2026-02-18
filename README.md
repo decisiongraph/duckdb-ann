@@ -1,4 +1,4 @@
-# annsearch — ANN Vector Indexes for DuckDB
+# ann — ANN Vector Indexes for DuckDB
 
 DuckDB extension providing approximate nearest neighbor (ANN) vector indexes using **DiskANN** and **FAISS**. Indexes are stored inside the `.duckdb` file, survive restarts, and integrate with the query optimizer.
 
@@ -190,13 +190,13 @@ SELECT row_id, distance FROM diskann_index_scan('docs', 'docs_ann', [0.1, ...]::
 -- Returns: (BIGINT row_id, FLOAT distance)
 ```
 
-### `annsearch_list` / `annsearch_index_info` — Diagnostics
+### `ann_list` / `ann_index_info` — Diagnostics
 
 ```sql
-SELECT * FROM annsearch_list();
+SELECT * FROM ann_list();
 -- name | engine  | table_name
 
-SELECT * FROM annsearch_index_info();
+SELECT * FROM ann_index_info();
 -- name | engine | table_name | num_vectors | num_deleted | memory_bytes | quantized
 ```
 
@@ -215,8 +215,8 @@ Input format: `[u32 num_vectors][u32 dimension][f32 * N * D]` (little-endian).
 
 ```bash
 # Clone with submodules
-git clone --recursive https://github.com/decisiongraph/duckdb-annsearch
-cd duckdb-annsearch
+git clone --recursive https://github.com/decisiongraph/duckdb-ann
+cd duckdb-ann
 
 # Build (DiskANN always, FAISS if available)
 make release GEN=ninja

@@ -1,6 +1,6 @@
 #include "diskann_index.hpp"
 #include "rust_ffi.hpp"
-#include "annsearch_extension.hpp"
+#include "ann_extension.hpp"
 #include "metal_diskann_bridge.h"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
