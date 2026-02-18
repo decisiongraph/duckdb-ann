@@ -16,7 +16,7 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: main
+      duckdb_version: v1.5-variegata
       ci_tools_version: main
       extension_name: ann
       extra_toolchains: rust
@@ -26,7 +26,7 @@ jobs:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
-      duckdb_version: main
+      duckdb_version: v1.5-variegata
       ci_tools_version: main
       extension_name: ann
       format_checks: 'format;tidy'
