@@ -40,6 +40,11 @@ static METAL_STATUS: AtomicI32 = AtomicI32::new(-1);
 /// multi-query batching (Phase 1) aggregates enough work to trigger GPU.
 pub const MIN_GPU_WORK: usize = 131072;
 
+/// Lower threshold for one-shot batch distance (no iterative overhead).
+/// Used by vector_distances() where a single GPU dispatch computes all distances.
+/// At 768-dim: fires at ~64 candidates (49152/768=64).
+pub const MIN_GPU_WORK_ONESHOT: usize = 49152;
+
 /// Check if Metal GPU acceleration is available (cached after first call).
 pub fn is_metal_available() -> bool {
     let status = METAL_STATUS.load(Ordering::Relaxed);
