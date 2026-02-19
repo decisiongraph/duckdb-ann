@@ -129,8 +129,17 @@ endif()
 # ========================================
 
 set(FAISS_METAL_AVAILABLE OFF)
-if(FAISS_AVAILABLE AND APPLE AND (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64"
-    OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64"))
+# Metal GPU only on arm64 — check target arch (CMAKE_OSX_ARCHITECTURES) first,
+# fall back to host arch (CMAKE_SYSTEM_PROCESSOR) for native builds.
+set(_ANN_TARGET_ARM64 OFF)
+if(CMAKE_OSX_ARCHITECTURES)
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        set(_ANN_TARGET_ARM64 ON)
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(_ANN_TARGET_ARM64 ON)
+endif()
+if(FAISS_AVAILABLE AND APPLE AND _ANN_TARGET_ARM64)
     find_library(METAL_FW Metal)
     find_library(MPS_FW MetalPerformanceShaders)
     if(METAL_FW AND MPS_FW)
@@ -159,6 +168,8 @@ else()
         message(STATUS "FAISS Metal GPU: DISABLED (FAISS not available)")
     elseif(NOT APPLE)
         message(STATUS "FAISS Metal GPU: DISABLED (not macOS)")
+    else()
+        message(STATUS "FAISS Metal GPU: DISABLED (not arm64 target)")
     endif()
 endif()
 
@@ -256,6 +267,13 @@ if(FAISS_METAL_AVAILABLE)
         FAISS_METAL_METALLIB_PATH="${CMAKE_BINARY_DIR}/faiss_metal.metallib")
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE FAISS_METAL_ENABLED=1
         FAISS_METAL_METALLIB_PATH="${CMAKE_BINARY_DIR}/faiss_metal.metallib")
+
+    # ObjC++ files (.mm) don't inherit OpenMP include paths from OpenMP::OpenMP_CXX —
+    # explicitly add them so gpu_backend_metal.mm can include FAISS headers (which include omp.h)
+    if(OpenMP_CXX_FOUND AND OpenMP_CXX_INCLUDE_DIRS)
+        target_include_directories(${EXTENSION_NAME} PRIVATE ${OpenMP_CXX_INCLUDE_DIRS})
+        target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${OpenMP_CXX_INCLUDE_DIRS})
+    endif()
 
     # Prioritize real SDK framework headers over nix apple-sdk
     if(REAL_MACOS_SDK)
