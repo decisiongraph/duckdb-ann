@@ -212,7 +212,19 @@ build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # ========================================
-# 5. Linking
+# 5. DuckDB version compat
+# ========================================
+
+# DuckDB v1.5+ changed several extension APIs (VerifyAndToString split,
+# GetData→GetDataInternal, TableIndexList::Scan removed, optimizer registration).
+# DUCKDB_MINOR_VERSION is set by DuckDB's CMakeLists.txt.
+if(DEFINED DUCKDB_MINOR_VERSION AND DUCKDB_MINOR_VERSION GREATER_EQUAL 5)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE DUCKDB_API_V15=1)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE DUCKDB_API_V15=1)
+endif()
+
+# ========================================
+# 6. Linking
 # ========================================
 
 # Link Rust library (DiskANN)

@@ -103,7 +103,12 @@ public:
 	idx_t GetInMemorySize(IndexLock &state) override;
 	bool MergeIndexes(IndexLock &state, BoundIndex &other_index) override;
 	void Vacuum(IndexLock &state) override;
+#ifdef DUCKDB_API_V15
+	void Verify(IndexLock &state) override;
+	string ToString(IndexLock &state, bool display_ascii = false) override;
+#else
 	string VerifyAndToString(IndexLock &state, const bool only_verify) override;
+#endif
 	void VerifyAllocations(IndexLock &state) override;
 	void VerifyBuffers(IndexLock &l) override;
 	string GetConstraintViolationMessage(VerifyExistenceType verify_type, idx_t failed_index,
@@ -194,7 +199,12 @@ public:
 	unique_ptr<AlterTableInfo> alter_table_info;
 
 public:
+#ifdef DUCKDB_API_V15
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override;
+#else
 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+#endif
 	bool IsSource() const override {
 		return true;
 	}

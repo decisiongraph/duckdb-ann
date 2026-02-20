@@ -271,6 +271,21 @@ static bool FindAnnIndex(ClientContext &context, DuckTableEntry &duck_table, col
 	};
 	vector<Candidate> candidates;
 
+#ifdef DUCKDB_API_V15
+	for (auto &idx : indexes.Indexes()) {
+		auto type = idx.GetIndexType();
+		if (type != "DISKANN" && type != "FAISS") {
+			continue;
+		}
+		auto &col_ids = idx.GetColumnIds();
+		for (auto &cid : col_ids) {
+			if (cid == physical_col) {
+				candidates.push_back({idx.GetIndexName(), type == "DISKANN"});
+				break;
+			}
+		}
+	}
+#else
 	indexes.Scan([&](Index &idx) {
 		auto type = idx.GetIndexType();
 		if (type != "DISKANN" && type != "FAISS") {
@@ -285,6 +300,7 @@ static bool FindAnnIndex(ClientContext &context, DuckTableEntry &duck_table, col
 		}
 		return false;
 	});
+#endif
 
 	// Bind indexes and find one with a compatible metric
 	for (auto &cand : candidates) {
@@ -550,7 +566,11 @@ static void AnnOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperat
 void RegisterAnnOptimizer(DatabaseInstance &db) {
 	OptimizerExtension ext;
 	ext.pre_optimize_function = AnnOptimize;
+#ifdef DUCKDB_API_V15
+	OptimizerExtension::Register(db.config, std::move(ext));
+#else
 	db.config.optimizer_extensions.push_back(std::move(ext));
+#endif
 }
 
 } // namespace duckdb

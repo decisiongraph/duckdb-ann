@@ -251,7 +251,11 @@ SinkFinalizeType PhysicalCreateDiskannIndex::Finalize(Pipeline &pipeline, Event 
 	// Call through BoundIndex reference to avoid name hiding from our overrides
 	BoundIndex &bi = *index;
 	bi.Vacuum();
+#ifdef DUCKDB_API_V15
+	bi.Verify();
+#else
 	D_ASSERT(!bi.VerifyAndToString(true).empty());
+#endif
 	bi.VerifyAllocations();
 
 	auto &schema = table.schema;
@@ -272,12 +276,20 @@ SinkFinalizeType PhysicalCreateDiskannIndex::Finalize(Pipeline &pipeline, Event 
 		idx_entry.initial_index_size = bi.GetInMemorySize();
 	} else {
 		auto &indexes = storage.GetDataTableInfo()->GetIndexes();
+#ifdef DUCKDB_API_V15
+		for (auto &idx : indexes.Indexes()) {
+			if (idx.GetIndexName() == info->index_name) {
+				throw CatalogException("an index with that name already exists for this table: %s", info->index_name);
+			}
+		}
+#else
 		indexes.Scan([&](Index &idx) {
 			if (idx.GetIndexName() == info->index_name) {
 				throw CatalogException("an index with that name already exists for this table: %s", info->index_name);
 			}
 			return false;
 		});
+#endif
 
 		auto &catalog = Catalog::GetCatalog(context, info->catalog);
 		catalog.Alter(context, *alter_table_info);
@@ -287,8 +299,13 @@ SinkFinalizeType PhysicalCreateDiskannIndex::Finalize(Pipeline &pipeline, Event 
 	return SinkFinalizeType::READY;
 }
 
+#ifdef DUCKDB_API_V15
+SourceResultType PhysicalCreateDiskannIndex::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                             OperatorSourceInput &input) const {
+#else
 SourceResultType PhysicalCreateDiskannIndex::GetData(ExecutionContext &context, DataChunk &chunk,
                                                      OperatorSourceInput &input) const {
+#endif
 	return SourceResultType::FINISHED;
 }
 
@@ -723,10 +740,20 @@ void DiskannIndex::Vacuum(IndexLock &state) {
 	is_dirty_ = true;
 }
 
+#ifdef DUCKDB_API_V15
+void DiskannIndex::Verify(IndexLock &state) {
+}
+
+string DiskannIndex::ToString(IndexLock &state, bool display_ascii) {
+	auto count = rust_handle_ ? DiskannDetachedCount(rust_handle_) : 0;
+	return StringUtil::Format("DiskANN Index %s (dim=%d, vectors=%lld, metric=%s)", name, dimension_, count, metric_);
+}
+#else
 string DiskannIndex::VerifyAndToString(IndexLock &state, const bool only_verify) {
 	auto count = rust_handle_ ? DiskannDetachedCount(rust_handle_) : 0;
 	return StringUtil::Format("DiskANN Index %s (dim=%d, vectors=%lld, metric=%s)", name, dimension_, count, metric_);
 }
+#endif
 
 void DiskannIndex::VerifyAllocations(IndexLock &state) {
 }

@@ -339,7 +339,11 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 
 	BoundIndex &bi = *index;
 	bi.Vacuum();
+#ifdef DUCKDB_API_V15
+	bi.Verify();
+#else
 	D_ASSERT(!bi.VerifyAndToString(true).empty());
+#endif
 	bi.VerifyAllocations();
 
 	auto &schema = table.schema;
@@ -360,12 +364,20 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 		idx_entry.initial_index_size = bi.GetInMemorySize();
 	} else {
 		auto &indexes = storage.GetDataTableInfo()->GetIndexes();
+#ifdef DUCKDB_API_V15
+		for (auto &idx : indexes.Indexes()) {
+			if (idx.GetIndexName() == info->index_name) {
+				throw CatalogException("an index with that name already exists for this table: %s", info->index_name);
+			}
+		}
+#else
 		indexes.Scan([&](Index &idx) {
 			if (idx.GetIndexName() == info->index_name) {
 				throw CatalogException("an index with that name already exists for this table: %s", info->index_name);
 			}
 			return false;
 		});
+#endif
 
 		auto &catalog = Catalog::GetCatalog(context, info->catalog);
 		catalog.Alter(context, *alter_table_info);
@@ -375,8 +387,13 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 	return SinkFinalizeType::READY;
 }
 
+#ifdef DUCKDB_API_V15
+SourceResultType PhysicalCreateFaissIndex::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                           OperatorSourceInput &input) const {
+#else
 SourceResultType PhysicalCreateFaissIndex::GetData(ExecutionContext &context, DataChunk &chunk,
                                                    OperatorSourceInput &input) const {
+#endif
 	return SourceResultType::FINISHED;
 }
 
@@ -855,11 +872,22 @@ void FaissIndex::Vacuum(IndexLock &state) {
 	is_dirty_ = true;
 }
 
+#ifdef DUCKDB_API_V15
+void FaissIndex::Verify(IndexLock &state) {
+}
+
+string FaissIndex::ToString(IndexLock &state, bool display_ascii) {
+	auto count = faiss_index_ ? faiss_index_->ntotal : 0;
+	return StringUtil::Format("FAISS Index %s (type=%s, dim=%d, vectors=%lld, metric=%s)", name, index_type_,
+	                          dimension_, count, metric_);
+}
+#else
 string FaissIndex::VerifyAndToString(IndexLock &state, const bool only_verify) {
 	auto count = faiss_index_ ? faiss_index_->ntotal : 0;
 	return StringUtil::Format("FAISS Index %s (type=%s, dim=%d, vectors=%lld, metric=%s)", name, index_type_,
 	                          dimension_, count, metric_);
 }
+#endif
 
 void FaissIndex::VerifyAllocations(IndexLock &state) {
 }
