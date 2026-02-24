@@ -280,11 +280,17 @@ if(FAISS_METAL_AVAILABLE)
     target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE FAISS_METAL_ENABLED=1
         FAISS_METAL_METALLIB_PATH="${CMAKE_BINARY_DIR}/faiss_metal.metallib")
 
-    # ObjC++ files (.mm) don't inherit OpenMP include paths from OpenMP::OpenMP_CXX —
-    # explicitly add them so gpu_backend_metal.mm can include FAISS headers (which include omp.h)
-    if(OpenMP_CXX_FOUND AND OpenMP_CXX_INCLUDE_DIRS)
-        target_include_directories(${EXTENSION_NAME} PRIVATE ${OpenMP_CXX_INCLUDE_DIRS})
-        target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${OpenMP_CXX_INCLUDE_DIRS})
+    # ObjC++ files (.mm) don't inherit OpenMP flags from OpenMP::OpenMP_CXX —
+    # CMake only applies -Xclang -fopenmp to CXX, not OBJCXX. Locate omp.h explicitly.
+    if(OpenMP_CXX_FOUND)
+        find_path(_OMP_INCLUDE_DIR omp.h
+            HINTS ${OpenMP_CXX_INCLUDE_DIRS}
+                  /opt/homebrew/opt/libomp/include   # Homebrew arm64
+                  /usr/local/opt/libomp/include)     # Homebrew x86_64
+        if(_OMP_INCLUDE_DIR)
+            target_include_directories(${EXTENSION_NAME} PRIVATE ${_OMP_INCLUDE_DIR})
+            target_include_directories(${LOADABLE_EXTENSION_NAME} PRIVATE ${_OMP_INCLUDE_DIR})
+        endif()
     endif()
 
     # Prioritize real SDK framework headers over nix apple-sdk
