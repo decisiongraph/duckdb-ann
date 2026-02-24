@@ -699,8 +699,26 @@ static OperatorFinalizeResultType AnnSearchTableFinal(ExecutionContext &context,
 static constexpr size_t MIN_GPU_WORK_ONESHOT = 49152;
 
 /// CPU L2/IP distance computation fallback.
+/// Uses Apple Accelerate vDSP (AMX coprocessor) when available.
+#ifdef HAVE_ACCELERATE
+#include <vecLib/vDSP.h>
+#endif
+
 static void ComputeDistancesCPU(const float *query, const float *candidates, idx_t n, idx_t dim, int metric,
                                 float *out) {
+#ifdef HAVE_ACCELERATE
+	if (metric == 0) { // L2
+		for (idx_t i = 0; i < n; i++) {
+			vDSP_distancesq(query, 1, candidates + i * dim, 1, &out[i], dim);
+		}
+	} else { // IP — negate so lower is better
+		for (idx_t i = 0; i < n; i++) {
+			float dot;
+			vDSP_dotpr(query, 1, candidates + i * dim, 1, &dot, dim);
+			out[i] = -dot;
+		}
+	}
+#else
 	for (idx_t i = 0; i < n; i++) {
 		const float *cand = candidates + i * dim;
 		float sum = 0;
@@ -717,6 +735,7 @@ static void ComputeDistancesCPU(const float *query, const float *candidates, idx
 		}
 		out[i] = sum;
 	}
+#endif
 }
 
 /// Compute distances: Metal GPU if batch large enough, else CPU.

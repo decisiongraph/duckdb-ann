@@ -174,6 +174,21 @@ else()
 endif()
 
 # ========================================
+# 3b. Apple Silicon optimization (NEON + Accelerate)
+# ========================================
+
+if(APPLE AND _ANN_TARGET_ARM64)
+    find_library(ACCELERATE_FW Accelerate)
+    if(ACCELERATE_FW)
+        set(HAVE_ACCELERATE ON)
+        message(STATUS "Apple Accelerate: FOUND")
+    else()
+        set(HAVE_ACCELERATE OFF)
+        message(STATUS "Apple Accelerate: NOT FOUND")
+    endif()
+endif()
+
+# ========================================
 # 4. C++ Extension sources
 # ========================================
 
@@ -201,6 +216,7 @@ list(APPEND EXTENSION_SOURCES
     src/faiss_vector_utils.cpp
     src/gpu_backend_cpu.cpp
     src/metal_diskann_stub.cpp
+    src/hnsw_metal_search.cpp
 )
 
 # Metal GPU backend (Objective-C++)
@@ -299,6 +315,19 @@ if(FAISS_METAL_AVAILABLE)
             -iframework ${REAL_MACOS_SDK}/System/Library/Frameworks)
         target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE
             -iframework ${REAL_MACOS_SDK}/System/Library/Frameworks)
+    endif()
+endif()
+
+# Apple Silicon: -mcpu=apple-m1 + Accelerate framework
+if(APPLE AND _ANN_TARGET_ARM64)
+    target_compile_options(${EXTENSION_NAME} PRIVATE -mcpu=apple-m1)
+    target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -mcpu=apple-m1)
+
+    if(HAVE_ACCELERATE)
+        target_link_libraries(${EXTENSION_NAME} ${ACCELERATE_FW})
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${ACCELERATE_FW})
+        target_compile_definitions(${EXTENSION_NAME} PRIVATE HAVE_ACCELERATE=1)
+        target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE HAVE_ACCELERATE=1)
     endif()
 endif()
 

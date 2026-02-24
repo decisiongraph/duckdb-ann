@@ -312,6 +312,71 @@ impl InMemoryIndex {
         Ok(label as u64)
     }
 
+    /// Add multiple vectors in a batch. Returns the assigned labels.
+    pub fn add_batch(&self, vectors: &[&[f32]]) -> Result<Vec<u64>> {
+        let mut labels = Vec::with_capacity(vectors.len());
+        let mut new_vectors = Vec::with_capacity(vectors.len());
+
+        for vector in vectors {
+            if vector.len() != self.dimension {
+                return Err(anyhow!(
+                    "Expected dimension {}, got {}",
+                    self.dimension,
+                    vector.len()
+                ));
+            }
+            let label = self.next_label.fetch_add(1, Ordering::Relaxed) as u32;
+            labels.push(label as u64);
+            new_vectors.push((label, vector));
+        }
+
+        // Fast path: index already initialized
+        {
+            let idx_guard = self.index.read();
+            if let Some(index) = idx_guard.as_ref() {
+                let ctx = DefaultContext;
+                for (label, vector) in &new_vectors {
+                    let strategy = FullPrecisionStrategy::new();
+                    runtime::block_on(index.insert(strategy, &ctx, label, *vector))
+                        .map_err(|e| anyhow!("DiskANN insert error: {}", e))?;
+                }
+                return Ok(labels);
+            }
+        }
+
+        // Slow path: first vectors, need write lock
+        let mut idx_guard = self.index.write();
+        if let Some(index) = idx_guard.as_ref() {
+            let ctx = DefaultContext;
+            for (label, vector) in &new_vectors {
+                let strategy = FullPrecisionStrategy::new();
+                runtime::block_on(index.insert(strategy, &ctx, label, *vector))
+                    .map_err(|e| anyhow!("DiskANN insert error: {}", e))?;
+            }
+        } else {
+            for (label, vector) in new_vectors {
+                self.provider.insert_start_point(label, vector.to_vec());
+            }
+
+            let prune_kind = PruneKind::from_metric(self.metric.to_diskann());
+            let mut builder = Builder::new(
+                self.max_degree as usize,
+                MaxDegree::default_slack(),
+                self.build_complexity as usize,
+                prune_kind,
+            );
+            builder.alpha(self.alpha);
+            let config = builder
+                .build()
+                .map_err(|e| anyhow!("DiskANN config error: {}", e))?;
+
+            let index = DiskANNIndex::new(config, self.provider.clone(), None);
+            *idx_guard = Some(index);
+        }
+
+        Ok(labels)
+    }
+
     pub fn search(&self, query: &[f32], k: usize, search_complexity: u32) -> Result<Vec<(u64, f32)>> {
         if query.len() != self.dimension {
             return Err(anyhow!(

@@ -18,6 +18,7 @@
 #include "duckdb/storage/table_io_manager.hpp"
 
 #include "faiss_wrapper.hpp"
+#include "hnsw_metal_search.hpp"
 
 namespace duckdb {
 
@@ -709,6 +710,22 @@ vector<pair<row_t, float>> FaissIndex::Search(const float *query, int32_t dimens
 	if (!faiss_index_ || dimension != dimension_) {
 		return {};
 	}
+
+#if defined(FAISS_METAL_ENABLED) || defined(HAVE_ACCELERATE)
+	// Metal/Accelerate fast path for HNSW indexes: custom graph traversal
+	// with batch distance dispatch to GPU or AMX coprocessor.
+	if ((index_type_ == "HNSW" || index_type_ == "hnsw") && mode_ != FaissGpuMode::CPU) {
+		auto raw_results = HnswMetalSearch(faiss_index_.get(), query, dimension, k, 0, deleted_labels_);
+		vector<pair<row_t, float>> results;
+		results.reserve(raw_results.size());
+		for (auto &p : raw_results) {
+			if (p.first >= 0 && p.first < static_cast<int64_t>(label_to_rowid_.size())) {
+				results.emplace_back(label_to_rowid_[p.first], p.second);
+			}
+		}
+		return results;
+	}
+#endif
 
 	int64_t request_k64 = static_cast<int64_t>(k) + static_cast<int64_t>(deleted_labels_.size());
 	request_k64 = MinValue<int64_t>(request_k64, static_cast<int64_t>(faiss_index_->ntotal));
