@@ -1,5 +1,18 @@
 #pragma once
 
+#include <cstdint>
+
+namespace duckdb {
+
+// GPU acceleration mode for FAISS indexes (available without FAISS_AVAILABLE for optimizer)
+enum class FaissGpuMode : uint8_t {
+	CPU = 0, // never upload to GPU
+	GPU = 1, // always upload, error if unavailable
+	AUTO = 2 // heuristic decides after index build (default)
+};
+
+} // namespace duckdb
+
 #ifdef FAISS_AVAILABLE
 
 #include "duckdb/execution/index/bound_index.hpp"
@@ -29,10 +42,11 @@ struct FaissParams {
 	int32_t nprobe = 1;
 	int64_t train_sample = 0;
 	string description;
-	bool gpu = false;
+	FaissGpuMode mode = FaissGpuMode::AUTO;
 
 	static FaissParams Parse(const case_insensitive_map_t<Value> &options) {
 		FaissParams p;
+		bool has_mode = false;
 		for (auto &kv : options) {
 			if (kv.first == "metric") {
 				p.metric = kv.second.ToString();
@@ -48,8 +62,24 @@ struct FaissParams {
 				p.train_sample = kv.second.GetValue<int64_t>();
 			} else if (kv.first == "description") {
 				p.description = kv.second.ToString();
+			} else if (kv.first == "mode") {
+				has_mode = true;
+				auto val = kv.second.ToString();
+				if (val == "cpu" || val == "CPU") {
+					p.mode = FaissGpuMode::CPU;
+				} else if (val == "gpu" || val == "GPU") {
+					p.mode = FaissGpuMode::GPU;
+				} else if (val == "auto" || val == "AUTO") {
+					p.mode = FaissGpuMode::AUTO;
+				} else {
+					throw InvalidInputException("Invalid mode '%s': expected 'cpu', 'gpu', or 'auto'", val);
+				}
 			} else if (kv.first == "gpu") {
-				p.gpu = BooleanValue::Get(kv.second.DefaultCastAs(LogicalType::BOOLEAN));
+				// Backward compat: gpu='true' -> GPU, gpu='false' -> CPU
+				if (!has_mode) {
+					bool gpu_val = BooleanValue::Get(kv.second.DefaultCastAs(LogicalType::BOOLEAN));
+					p.mode = gpu_val ? FaissGpuMode::GPU : FaissGpuMode::CPU;
+				}
 			}
 		}
 		if (p.index_type.empty()) {
@@ -67,8 +97,16 @@ struct FaissParams {
 		if (!description.empty()) {
 			opts["description"] = Value(description);
 		}
-		if (gpu) {
-			opts["gpu"] = Value::BOOLEAN(true);
+		switch (mode) {
+		case FaissGpuMode::CPU:
+			opts["mode"] = Value("cpu");
+			break;
+		case FaissGpuMode::GPU:
+			opts["mode"] = Value("gpu");
+			break;
+		case FaissGpuMode::AUTO:
+			opts["mode"] = Value("auto");
+			break;
 		}
 		return opts;
 	}
@@ -129,8 +167,8 @@ public:
 	int32_t GetNprobe() const {
 		return nprobe_;
 	}
-	bool GetGpu() const {
-		return gpu_;
+	FaissGpuMode GetGpuMode() const {
+		return mode_;
 	}
 	idx_t GetVectorCount() const {
 		return faiss_index_ ? static_cast<idx_t>(faiss_index_->ntotal) : 0;
@@ -161,7 +199,7 @@ private:
 	int32_t nprobe_ = 1;
 	int64_t train_sample_ = 0; // 0 = use all vectors for training
 	string description_;
-	bool gpu_ = false;
+	FaissGpuMode mode_ = FaissGpuMode::AUTO;
 
 	// GPU-resident copy of faiss_index_ (for search acceleration)
 	std::unique_ptr<faiss::Index> gpu_index_;

@@ -230,7 +230,7 @@ struct FoundIndex {
 	string metric = "L2";
 	string index_type; // Flat, HNSW, IVFFlat (FAISS) or DiskANN
 	int32_t nprobe = 1;
-	bool gpu = false;
+	FaissGpuMode mode = FaissGpuMode::AUTO;
 };
 
 // Map distance function name to required index metric
@@ -307,7 +307,7 @@ static bool FindAnnIndex(ClientContext &context, DuckTableEntry &duck_table, col
 		string metric;
 		string index_type;
 		int32_t nprobe = 1;
-		bool gpu = false;
+		FaissGpuMode mode = FaissGpuMode::AUTO;
 		if (cand.is_diskann) {
 			indexes.Bind(context, table_info, DiskannIndex::TYPE_NAME);
 			auto idx_ptr = indexes.Find(cand.name);
@@ -326,7 +326,7 @@ static bool FindAnnIndex(ClientContext &context, DuckTableEntry &duck_table, col
 				metric = fi.GetMetric();
 				index_type = fi.GetFaissType();
 				nprobe = fi.GetNprobe();
-				gpu = fi.GetGpu();
+				mode = fi.GetGpuMode();
 			}
 		}
 #endif
@@ -336,7 +336,7 @@ static bool FindAnnIndex(ClientContext &context, DuckTableEntry &duck_table, col
 			result.metric = metric;
 			result.index_type = index_type;
 			result.nprobe = nprobe;
-			result.gpu = gpu;
+			result.mode = mode;
 			return true;
 		}
 	}
@@ -514,8 +514,10 @@ static bool TryOptimizeOrderBy(ClientContext &context, unique_ptr<LogicalOperato
 		if (found_idx.nprobe > 1) {
 			extra_params += StringUtil::Format(", nprobe: %d", found_idx.nprobe);
 		}
-		if (found_idx.gpu) {
-			extra_params += ", gpu: metal";
+		if (found_idx.mode == FaissGpuMode::GPU) {
+			extra_params += ", mode: gpu";
+		} else if (found_idx.mode == FaissGpuMode::AUTO) {
+			extra_params += ", mode: auto";
 		}
 	}
 	target_get->extra_info.file_filters = StringUtil::Format("ANN_INDEX_SCAN (index: %s, k: %llu, engine: %s%s)",
