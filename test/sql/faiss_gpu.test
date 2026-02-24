@@ -1,5 +1,5 @@
 # name: test/sql/faiss_gpu.test
-# description: Test FAISS GPU info function and gpu=true/false flag
+# description: Test FAISS GPU info function and mode=cpu/gpu/auto
 # group: [faiss]
 
 require ann
@@ -26,7 +26,7 @@ SELECT length(device) > 0 FROM faiss_gpu_info();
 true
 
 # ========================================
-# gpu=false (default) — should work everywhere
+# mode=cpu — should work everywhere
 # ========================================
 
 statement ok
@@ -39,7 +39,7 @@ INSERT INTO vecs VALUES
   (3, [0.0, 0.0, 1.0]);
 
 statement ok
-CREATE INDEX cpu_idx ON vecs USING FAISS (embedding) WITH (gpu = 'false');
+CREATE INDEX cpu_idx ON vecs USING FAISS (embedding) WITH (mode = 'cpu');
 
 query II
 SELECT v.id, s.distance
@@ -52,16 +52,49 @@ statement ok
 DROP INDEX cpu_idx;
 
 # ========================================
-# gpu=true — creates GPU-accelerated index (degrades gracefully to CPU)
+# backward compat: gpu='false' maps to mode=cpu
 # ========================================
 
 statement ok
-CREATE INDEX gpu_idx ON vecs USING FAISS (embedding) WITH (gpu = 'true');
+CREATE INDEX compat_cpu ON vecs USING FAISS (embedding) WITH (gpu = 'false');
 
-# Search should work regardless of GPU availability (falls back to CPU)
 query II
 SELECT v.id, s.distance
-FROM faiss_index_scan('vecs', 'gpu_idx', [1.0, 0.0, 0.0], 1) s
+FROM faiss_index_scan('vecs', 'compat_cpu', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+DROP INDEX compat_cpu;
+
+# ========================================
+# default (no option) — uses auto mode
+# ========================================
+
+statement ok
+CREATE INDEX auto_idx ON vecs USING FAISS (embedding);
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('vecs', 'auto_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vecs v ON v.rowid = s.row_id;
+----
+1	0.0
+
+statement ok
+DROP INDEX auto_idx;
+
+# ========================================
+# mode=auto explicit — same as default
+# ========================================
+
+statement ok
+CREATE INDEX auto_explicit ON vecs USING FAISS (embedding) WITH (mode = 'auto');
+
+query II
+SELECT v.id, s.distance
+FROM faiss_index_scan('vecs', 'auto_explicit', [1.0, 0.0, 0.0], 1) s
 JOIN vecs v ON v.rowid = s.row_id;
 ----
 1	0.0
@@ -72,16 +105,16 @@ INSERT INTO vecs VALUES (4, [0.9, 0.1, 0.0]);
 
 query II
 SELECT v.id, s.distance
-FROM faiss_index_scan('vecs', 'gpu_idx', [1.0, 0.0, 0.0], 1) s
+FROM faiss_index_scan('vecs', 'auto_explicit', [1.0, 0.0, 0.0], 1) s
 JOIN vecs v ON v.rowid = s.row_id;
 ----
 1	0.0
 
 statement ok
-DROP INDEX gpu_idx;
+DROP INDEX auto_explicit;
 
 # ========================================
-# gpu=true persistence — flag survives restart
+# mode=auto persistence — flag survives restart
 # ========================================
 
 load __TEST_DIR__/faiss_gpu_persist.db
@@ -95,14 +128,14 @@ INSERT INTO gpuvecs VALUES
   (2, [0.0, 1.0, 0.0]);
 
 statement ok
-CREATE INDEX gpu_persist ON gpuvecs USING FAISS (embedding) WITH (gpu = 'true');
+CREATE INDEX gpu_persist ON gpuvecs USING FAISS (embedding) WITH (mode = 'auto');
 
 statement ok
 CHECKPOINT;
 
 restart
 
-# Search works after restart even with gpu=true flag
+# Search works after restart with mode=auto
 query II
 SELECT v.id, s.distance
 FROM faiss_index_scan('gpuvecs', 'gpu_persist', [1.0, 0.0, 0.0], 1) s

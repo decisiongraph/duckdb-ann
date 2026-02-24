@@ -81,7 +81,7 @@ FaissIndex::FaissIndex(const string &name, IndexConstraintType constraint_type, 
 	nprobe_ = params.nprobe;
 	train_sample_ = params.train_sample;
 	description_ = params.description;
-	gpu_ = params.gpu;
+	mode_ = params.mode;
 
 	// Detect dimension
 	if (!unbound_expressions.empty()) {
@@ -106,19 +106,45 @@ FaissIndex::~FaissIndex() {
 }
 
 void FaissIndex::EnsureGpuIndex() {
-	if (!gpu_ || !faiss_index_ || gpu_index_) {
+	if (mode_ == FaissGpuMode::CPU || !faiss_index_ || gpu_index_) {
 		return;
 	}
+
 	auto &backend = GetGpuBackend();
+
+	if (mode_ == FaissGpuMode::GPU) {
+		// Explicit GPU mode: error if unavailable
+		if (!backend.IsAvailable()) {
+			throw InvalidInputException("mode='gpu' requested but no GPU backend available");
+		}
+		try {
+			gpu_index_ = backend.CpuToGpu(faiss_index_.get());
+		} catch (std::runtime_error &e) {
+			throw InvalidInputException("mode='gpu' requested but index type unsupported on GPU: %s", e.what());
+		}
+		return;
+	}
+
+	// AUTO mode: heuristic decides
 	if (!backend.IsAvailable()) {
+		return;
+	}
+	// HNSW unsupported on Metal
+	if (index_type_ == "HNSW" || index_type_ == "hnsw") {
+		return;
+	}
+	// Too few vectors — GPU overhead not worthwhile
+	if (faiss_index_->ntotal < 256) {
+		return;
+	}
+	// Low dimensions — GPU pays off at dim >= 128
+	if (dimension_ < 128) {
 		return;
 	}
 	try {
 		gpu_index_ = backend.CpuToGpu(faiss_index_.get());
-	} catch (std::runtime_error &e) {
-		// Unsupported index type (e.g. HNSW on Metal) — fall back to CPU with warning
-		gpu_ = false;
-		Printer::Print(StringUtil::Format("Warning: GPU disabled for index '%s': %s", name, e.what()));
+	} catch (std::runtime_error &) {
+		// Silently fall back to CPU in auto mode
 	}
 }
 
@@ -329,7 +355,7 @@ SinkFinalizeType PhysicalCreateFaissIndex::Finalize(Pipeline &pipeline, Event &e
 	index->nprobe_ = state.params.nprobe;
 	index->train_sample_ = state.params.train_sample;
 	index->description_ = state.params.description;
-	index->gpu_ = state.params.gpu;
+	index->mode_ = state.params.mode;
 	index->label_to_rowid_ = std::move(label_to_rowid);
 	index->rowid_to_label_ = std::move(rowid_to_label);
 	index->is_dirty_ = true;
@@ -549,8 +575,8 @@ void FaissIndex::PersistToDisk() {
 	if (desc_len > 0) {
 		writer.Write(reinterpret_cast<const uint8_t *>(description_.data()), desc_len);
 	}
-	uint8_t gpu_byte = gpu_ ? 1 : 0;
-	writer.Write(&gpu_byte, sizeof(uint8_t));
+	uint8_t mode_byte = static_cast<uint8_t>(mode_);
+	writer.Write(&mode_byte, sizeof(uint8_t));
 
 	is_dirty_ = false;
 }
@@ -624,9 +650,9 @@ void FaissIndex::LoadFromStorage(const IndexStorageInfo &info) {
 		reader.Read(reinterpret_cast<uint8_t *>(desc_buf.data()), desc_len);
 		description_.assign(desc_buf.data(), desc_len);
 	}
-	uint8_t gpu_byte = 0;
-	reader.Read(&gpu_byte, sizeof(uint8_t));
-	gpu_ = (gpu_byte != 0);
+	uint8_t mode_byte = 0;
+	reader.Read(&mode_byte, sizeof(uint8_t));
+	mode_ = static_cast<FaissGpuMode>(mode_byte);
 
 	// Rebuild rowid_to_label_ from label_to_rowid_
 	rowid_to_label_.reserve(num_mappings);
@@ -641,7 +667,7 @@ void FaissIndex::LoadFromStorage(const IndexStorageInfo &info) {
 	faiss_reader.data = std::move(faiss_data);
 	faiss_index_.reset(faiss::read_index(&faiss_reader));
 
-	// Upload to GPU if the index was created with gpu=true
+	// Upload to GPU based on mode (gpu/auto)
 	EnsureGpuIndex();
 
 	is_dirty_ = false;
@@ -878,14 +904,16 @@ void FaissIndex::Verify(IndexLock &state) {
 
 string FaissIndex::ToString(IndexLock &state, bool display_ascii) {
 	auto count = faiss_index_ ? faiss_index_->ntotal : 0;
-	return StringUtil::Format("FAISS Index %s (type=%s, dim=%d, vectors=%lld, metric=%s)", name, index_type_,
-	                          dimension_, count, metric_);
+	const char *mode_str = mode_ == FaissGpuMode::GPU ? "gpu" : mode_ == FaissGpuMode::AUTO ? "auto" : "cpu";
+	return StringUtil::Format("FAISS Index %s (type=%s, dim=%d, vectors=%lld, metric=%s, mode=%s)", name, index_type_,
+	                          dimension_, count, metric_, mode_str);
 }
 #else
 string FaissIndex::VerifyAndToString(IndexLock &state, const bool only_verify) {
 	auto count = faiss_index_ ? faiss_index_->ntotal : 0;
-	return StringUtil::Format("FAISS Index %s (type=%s, dim=%d, vectors=%lld, metric=%s)", name, index_type_,
-	                          dimension_, count, metric_);
+	const char *mode_str = mode_ == FaissGpuMode::GPU ? "gpu" : mode_ == FaissGpuMode::AUTO ? "auto" : "cpu";
+	return StringUtil::Format("FAISS Index %s (type=%s, dim=%d, vectors=%lld, metric=%s, mode=%s)", name, index_type_,
+	                          dimension_, count, metric_, mode_str);
 }
 #endif
 
